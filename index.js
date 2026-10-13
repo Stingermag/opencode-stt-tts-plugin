@@ -233,13 +233,19 @@ function wrapRawToWav(rawPath, wavPath, rate) {
 export default Plugin.define({
   id: "voice",
   setup(context) {
+    log("setup: plugin initialized, checking runtime")
+
     // This plugin is TUI-only. The server runtime also discovers plugins under
     // ~/.config/opencode/plugins but has no TUI APIs — no-op there.
     if (!context?.keymap || !context?.ui || !context?.storage) {
-      log(`setup skipped: runtime without TUI API (keys: ${Object.keys(context ?? {}).join(",")})`)
+      log("setup: skipping - no TUI API")
+      log("setup: available keys: " + JSON.stringify(Object.keys(context ?? {})))
       return
     }
-    log("setup: TUI runtime, registering commands")
+
+    // Additional safety check
+    try {
+      log("setup: TUI runtime, registering commands")
     const o = context.options ?? {}
     log(`TUI options keys: ${JSON.stringify(Object.keys(o))} (sttLanguage=${o.sttLanguage ?? "unset"}, cudaBin=${o.cudaBin ?? "unset"}, whisperCli=${o.whisperCli ?? "unset"}, whisperDevice=${o.whisperDevice ?? "unset"}, llmModel=${o.llmModel ?? "unset"}, llmKeepAlive=${o.llmKeepAlive ?? "unset"})`)
     const soxBin = o.sox || "sox"
