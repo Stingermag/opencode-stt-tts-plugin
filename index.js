@@ -492,6 +492,30 @@ export default Plugin.define({
     let piperLastDataAt = 0
     let piperQuietTimer = null
     let currentPiperAbandon = null
+    // ---- Pause-on-loud-sound ------------------------------------------------
+    // When the mic hears something loud while the narrator is talking, stop the
+    // clip for a moment and resume it from the same offset instead of playing
+    // over the noise. Volume control was rejected on purpose: sox --interactive
+    // refuses a piped stdin ("Standard input has to be a terminal"), and the
+    // CoreAudio route needs a long-lived PowerShell helper. Stopping and
+    // restarting from a trim offset is the only option that works with no
+    // external dependency.
+    //
+    // CAVEAT, and it matters: through speakers the narrator hears ITSELF. The
+    // code elsewhere records speaker-echo peaks of 20000-30000, so a threshold
+    // low enough to catch a real noise is also reachable by the bot's own voice
+    // and it will pause itself. Use headphones, or set the threshold well above
+    // your echo floor.
+    let pauseHook = null          // set by the active speak() to pause its clip
+    let pauseTicks = 0            // consecutive loud VAD ticks before pausing
+    const ttsPauseOnLoudRaw = o.ttsPauseOnLoud
+    const ttsPauseOnLoud = ttsPauseOnLoudRaw !== false
+    const ttsPauseMsRaw = Number(o.ttsPauseMs)
+    const ttsPauseMs = Number.isFinite(ttsPauseMsRaw) && ttsPauseMsRaw >= 200 ? ttsPauseMsRaw : 2000
+    const ttsPausePeakRaw = Number(o.ttsPausePeak)
+    const ttsPausePeak = Number.isFinite(ttsPausePeakRaw) && ttsPausePeakRaw > 0 ? ttsPausePeakRaw : 20000
+    const ttsPauseTicksRaw = Number(o.ttsPauseTicks)
+    const ttsPauseTicks = Number.isFinite(ttsPauseTicksRaw) && ttsPauseTicksRaw >= 1 ? ttsPauseTicksRaw : 3
     // Calibration needs a much longer settle than normal synthesis. The marker is
     // only ~200ms of audio but piper emits it in more than one burst, so the
     // normal 120ms quiet fires part-way through and measures a TRUNCATED marker
@@ -718,6 +742,8 @@ export default Plugin.define({
     // stopPlayback() opens a new post-listen window; entering standby must not.
     function stopPlaybackSilently() {
       abandonPiperUtterance()
+      pauseHook = null
+      pauseTicks = 0
       if (!playback) return
       try { playback.piper.kill() } catch {}
       try { playback.sox.kill() } catch {}
@@ -728,6 +754,9 @@ export default Plugin.define({
 
     function stopPlayback() {
       abandonPiperUtterance()
+      // A pending resume would restart sox after the clip was already killed.
+      pauseHook = null
+      pauseTicks = 0
       if (!playback) return
       try { playback.piper.kill() } catch {}
       try { playback.sox.kill() } catch {}
@@ -1506,6 +1535,23 @@ $audio.PlaySync()
           // playback ends + a short echo cooldown, so gaps between chunks and
           // the ringing tail of the last word are also gated.
           const playing = ttsActive || Date.now() < ttsEndAt
+          // Pause-on-loud-sound. Runs before the barge-in branch and is
+          // independent of bargeInEnabled: this is about yielding the floor to
+          // a loud noise, not about being interrupted. Requires several
+          // consecutive loud ticks so a single bang does not stall the reply.
+          if (ttsPauseOnLoud && pauseHook && playing) {
+            if (peak >= ttsPausePeak) {
+              pauseTicks++
+              if (pauseTicks >= ttsPauseTicks) {
+                pauseTicks = 0
+                pauseHook()
+              }
+            } else {
+              pauseTicks = 0
+            }
+          } else if (!playing) {
+            pauseTicks = 0
+          }
           let bargeIn = false
           if (!bargeInEnabled && playing) {
             // Half-duplex: mic is deaf for the whole TTS window. Nothing can
@@ -2294,32 +2340,83 @@ $audio.PlaySync()
             done()
             return
           }
-          // Один sox на один клип. У sox нет демон-режима: без файла и без
+          // Один sox на клип. У sox нет демон-режима: без файла и без
           // "-t waveaudio -d" он читает stdin и выбрасывает звук, поэтому
           // держать один процесс и подсовывать ему файлы невозможно.
-          const sox = spawn(soxBin, [
-            "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
-            rawPath,
-            "-t", "waveaudio", "-d",
-          ], { windowsHide: true })
-          mine.sox = sox
-          playingSince = Date.now()
-          // Duration of what sox is about to play, so the mic can be armed a
-          // moment before the last word instead of after it.
-          playEndsAt = playingSince + Math.floor((padded.length / 2) * 1000 / rate)
-          preArmed = false
-          isLastFragmentActive = isLastFragment
-          bargeLoudTicks = 0
-
+          // But it CAN resume mid-file via `trim <seconds>`, which is what the
+          // pause-on-loud-sound path uses: kill, then restart from the offset.
+          const totalSec = (padded.length / 2) / rate
           const cleanup = () => { try { fs.unlinkSync(rawPath) } catch {} }
-          log(`speak: sox-play pid=${sox.pid} (file), rate=${rate}`)
-          sox.on("close", (code) => {
-            log(`speak: sox-play closed code=${code}`)
-            if (active()) playback = null
-            cleanup()
-            done()
-          })
-          sox.on("error", (e) => { log(`speak: sox-play error ${e?.message || e}`); cleanup(); done() })
+          // Seconds of the clip already played, counting earlier paused stretches.
+          let playedOffset = 0
+          let paused = false
+          let resumeTimer = null
+
+          const startSoxFrom = (offsetSec) => {
+            // sox argument order is [input opts] infile [output opts] outfile
+            // [effects] — effects AFTER the output file. Putting trim before it
+            // makes sox fail with "Not enough input filenames specified".
+            const args = [
+              "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
+              rawPath,
+              "-t", "waveaudio", "-d",
+            ]
+            if (offsetSec > 0.05) args.push("trim", offsetSec.toFixed(3))
+            const sox = spawn(soxBin, args, { windowsHide: true })
+            mine.sox = sox
+            playingSince = Date.now()
+            // Duration of what sox is about to play, so the mic can be armed a
+            // moment before the last word instead of after it. Rebased from the
+            // REMAINING audio, which is what keeps the pre-roll honest across
+            // a pause: without this the deadline stays where it was and the
+            // listen window opens while the narrator is still mid-clip.
+            playEndsAt = playingSince + Math.floor((totalSec - offsetSec) * 1000)
+            preArmed = false
+            isLastFragmentActive = isLastFragment
+            bargeLoudTicks = 0
+            log(`speak: sox-play pid=${sox.pid} offset=${offsetSec.toFixed(2)}s rate=${rate}`)
+            sox.on("close", (code) => {
+              // A pause kills sox deliberately. That close is NOT the end of the
+              // clip — falling through to cleanup()/done() here would delete the
+              // temp file and end the reply mid-sentence.
+              if (paused) { log(`speak: sox-play closed (пауза) code=${code}`); return }
+              log(`speak: sox-play closed code=${code}`)
+              if (pauseHook === pauseClip) pauseHook = null
+              if (active()) playback = null
+              cleanup()
+              done()
+            })
+            sox.on("error", (e) => {
+              if (paused) return
+              log(`speak: sox-play error ${e?.message || e}`)
+              if (pauseHook === pauseClip) pauseHook = null
+              cleanup()
+              done()
+            })
+          }
+
+          // Stop mid-clip and pick up where we left off after `ms`.
+          function pauseClip() {
+            if (paused || dead || !mine.sox) return
+            paused = true
+            // Everything played so far: the offset this run started from plus
+            // however long this run has been going.
+            playedOffset += (Date.now() - playingSince) / 1000
+            if (playedOffset >= totalSec - 0.05) { paused = false; return } // already finished
+            const proc = mine.sox
+            mine.sox = null
+            try { proc.kill() } catch {}
+            log(`tts: пауза на ${ttsPauseMs}мс, позиция ${playedOffset.toFixed(2)}/${totalSec.toFixed(2)}с`)
+            resumeTimer = setTimeout(() => {
+              resumeTimer = null
+              if (dead || !active()) { paused = false; pauseHook = null; return }
+              paused = false
+              startSoxFrom(playedOffset)
+            }, ttsPauseMs)
+          }
+          if (ttsPauseOnLoud) pauseHook = pauseClip
+
+          startSoxFrom(0)
         }
       })
     }
