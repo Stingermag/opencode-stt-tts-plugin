@@ -492,6 +492,13 @@ export default Plugin.define({
     let piperLastDataAt = 0
     let piperQuietTimer = null
     let currentPiperAbandon = null
+    // Calibration needs a much longer settle than normal synthesis. The marker is
+    // only ~200ms of audio but piper emits it in more than one burst, so the
+    // normal 120ms quiet fires part-way through and measures a TRUNCATED marker
+    // (observed: 2204B instead of 8820B). Under-stripping is not fatal — the
+    // leftover is silence, so clips just gain a little trailing padding — but
+    // measuring the real size keeps the stream in sync and the gap tight.
+    let piperCalibQuietMs = 600
     const PIPER_MARKER = "."
     // Echo gate: ttsActive is true from the moment speak() starts until playback
     // fully ends; ttsEndAt adds a short cooldown after so the tail of the last
@@ -2020,7 +2027,7 @@ $audio.PlaySync()
           return
         }
         finishPiperUtterance()
-      }, piperQuietMs)
+      }, piperCalibrating ? piperCalibQuietMs : piperQuietMs)
     }
 
     function finishPiperUtterance() {
