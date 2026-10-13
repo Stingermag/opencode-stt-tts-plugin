@@ -476,11 +476,17 @@ export default Plugin.define({
     // peak gate passes, so the cost stays small. Keep the window (below) larger
     // than the cadence or a short word can fall between two windows.
     const wakeScanRaw = Number(o.wakeScanMs)
-    const wakeScanMs = Number.isFinite(wakeScanRaw) && wakeScanRaw >= 150 ? wakeScanRaw : 350
+    const wakeScanMs = Number.isFinite(wakeScanRaw) && wakeScanRaw >= 150 ? wakeScanRaw : 200
     const wakeScanStandbyRaw = Number(o.wakeScanStandbyMs)
-    const wakeScanStandbyMs = Number.isFinite(wakeScanStandbyRaw) && wakeScanStandbyRaw >= 150 ? wakeScanStandbyRaw : 600
-    // Audio window handed to whisper for the wake check. Longer = slower whisper
-    // but a higher chance the whole word is inside one window.
+    const wakeScanStandbyMs = Number.isFinite(wakeScanStandbyRaw) && wakeScanStandbyRaw >= 150 ? wakeScanStandbyRaw : 250
+    // Audio window handed to whisper for the wake check.
+    // Measured: whisper latency is FLAT in window length (0.7s and 3s of audio
+    // both take ~590ms with the base model) because whisper.cpp pads to a fixed
+    // 30s context. So a short window buys no speed — only robustness, by
+    // keeping consecutive windows overlapping. That overlap is the real
+    // constraint: window must stay well above the cadence or a word can start
+    // after one window ends and finish before the next begins, falling
+    // outside both (this is what used to swallow «заткнись»).
     const wakeWindowRaw = Number(o.wakeWindowSec)
     const wakeWindowSec = Number.isFinite(wakeWindowRaw) && wakeWindowRaw >= 0.8 ? wakeWindowRaw : 2
     // Grace period after killing the detector's own sox before re-opening the mic.
@@ -536,6 +542,11 @@ export default Plugin.define({
     let wakeFile = null
     let wakeTimer = null
     let wakeBusy = false
+    // Tick counter, used only to throttle the per-tick log lines. At a short
+    // cadence those fire several times a second, and each one is a synchronous
+    // appendFileSync inside the hot path — enough I/O and log spam to distort
+    // the very timings this loop exists to minimise.
+    let wakeTick = 0
     // Hands-free mode: mic stays armed, sox stops itself after hfSilence of
     // silence, the segment is transcribed+sent automatically, mic re-arms.
     const [hf, setHf] = context.storage.memory("voice-hf", { initial: { on: false } })
@@ -691,7 +702,11 @@ export default Plugin.define({
 
     async function scanWakeAudio() {
       if (wakeBusy) return
-      log(`wake: scan tick (recording=${recording}, hf.on=${hf.on}, wakeFile=${wakeFile ? "set" : "null"}, rawFile=${rawFile ? "set" : "null"})`)
+      // Sampled, not per-tick: see wakeTick.
+      const logTick = ++wakeTick % 40 === 0
+      if (logTick) {
+        log(`wake: scan tick #${wakeTick} (recording=${recording}, hf.on=${hf.on}, wakeFile=${wakeFile ? "set" : "null"}, rawFile=${rawFile ? "set" : "null"})`)
+      }
       // Prefer the VAD raw file when recording is active AND has data,
       // otherwise use our own wake file. A 0-byte rawFile means sox hasn't
       // started writing yet — fall back to wakeFile so we don't stall.
@@ -705,7 +720,9 @@ export default Plugin.define({
         if (wst.size >= MIN_SEGMENT_BYTES) targetFile = wakeFile
       }
       if (!targetFile) {
-        log(`wake: no data (rawFile=${rawFile && fs.existsSync(rawFile) ? fs.statSync(rawFile).size : "missing"}, wakeFile=${wakeFile && fs.existsSync(wakeFile) ? fs.statSync(wakeFile).size : "missing"})`)
+        if (logTick) {
+          log(`wake: no data (rawFile=${rawFile && fs.existsSync(rawFile) ? fs.statSync(rawFile).size : "missing"}, wakeFile=${wakeFile && fs.existsSync(wakeFile) ? fs.statSync(wakeFile).size : "missing"})`)
+        }
         return
       }
       wakeBusy = true
