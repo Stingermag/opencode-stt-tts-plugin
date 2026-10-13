@@ -285,8 +285,15 @@ export default Plugin.define({
     const autoSubmit = o.autoSubmit === true
     const trimSilence = o.trimSilence !== false
     // Hands-free: seconds of silence that end an utterance (sox trailing trim).
+    // This is the single largest contributor to "I spoke and then waited" — it
+    // gates the segment close, and therefore everything downstream of it. 1s is
+    // the floor the validation below allows, and the practical limit given the
+    // 500ms VAD tick: the segment can't close sooner than the first tick past
+    // the threshold, so the real pause lands at 1.0-1.5s. Going lower only
+    // buys resolution we can't use and starts cutting phrases mid-thought at
+    // natural clause boundaries.
     const hfSilenceRaw = Number(o.handsFreeSilence)
-    const hfSilence = Number.isFinite(hfSilenceRaw) && hfSilenceRaw >= 1 ? hfSilenceRaw : 3.0
+    const hfSilence = Number.isFinite(hfSilenceRaw) && hfSilenceRaw >= 1 ? hfSilenceRaw : 1.0
     // Amplitude thresholds for sox silence detection (leading onset / trailing
     // stop). A higher hands-free threshold keeps room noise from triggering
     // phantom segments that whisper would transcribe into hallucinations.
