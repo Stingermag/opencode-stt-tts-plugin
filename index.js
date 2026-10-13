@@ -323,7 +323,7 @@ export default Plugin.define({
     // NOTE: cli.json sets ttsLengthScale explicitly and OVERRIDES this default —
     // keep the two in sync or the value here silently does nothing.
     const ttsLengthScaleRaw = Number(o.ttsLengthScale)
-    const ttsLengthScale = Number.isFinite(ttsLengthScaleRaw) && ttsLengthScaleRaw >= 0.3 && ttsLengthScaleRaw <= 2 ? ttsLengthScaleRaw : 0.6
+    const ttsLengthScale = Number.isFinite(ttsLengthScaleRaw) && ttsLengthScaleRaw >= 0.3 && ttsLengthScaleRaw <= 2 ? ttsLengthScaleRaw : 1.05
     const ttsSentenceSilenceRaw = Number(o.ttsSentenceSilence)
     const ttsSentenceSilence = Number.isFinite(ttsSentenceSilenceRaw) && ttsSentenceSilenceRaw >= 0 ? ttsSentenceSilenceRaw : 0.05
     // Trailing silence (seconds) appended to every generated clip. On Windows,
