@@ -500,10 +500,13 @@ export default Plugin.define({
     const blipFreqLo = Number.isFinite(blipFreqLoRaw) && blipFreqLoRaw >= 40 ? blipFreqLoRaw : 130
     const blipFreqHiRaw = Number(o.blipFreqHi)
     const blipFreqHi = Number.isFinite(blipFreqHiRaw) && blipFreqHiRaw >= 40 ? blipFreqHiRaw : 175
-    // Fraction of full scale. 1.0 = clipping; the old 32000 (0.98) was loud
-    // enough to leak into the open microphone and colour the next transcript.
+    // Fraction of full scale, as the amplitude ceiling for the tone before the
+    // fade/decay envelope is applied. 1.0 = hard clipping, so stay below.
+    // Deliberately loud by default: the tone is well under F1 now, so the
+    // interference that motivated lowering it came from the PITCH, not the
+    // level. Lower it if you hear the blip bleed into a transcript.
     const blipLevelRaw = Number(o.blipLevel)
-    const blipLevel = Number.isFinite(blipLevelRaw) && blipLevelRaw > 0 && blipLevelRaw <= 1 ? blipLevelRaw : 0.25
+    const blipLevel = Number.isFinite(blipLevelRaw) && blipLevelRaw > 0 && blipLevelRaw <= 1 ? blipLevelRaw : 0.95
     let lastVoiceAt = Date.now()
     // When the capture segment started and when playback last ended. Anything
     // recorded BETWEEN those two was the assistant's own voice coming back
