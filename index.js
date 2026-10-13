@@ -233,6 +233,47 @@ function wrapRawToWav(rawPath, wavPath, rate) {
 export default Plugin.define({
   id: "voice",
   setup(context) {
+    // Auto-reload plugin when files change
+    let reloadTimer = null
+    const pluginPath = path.resolve(__dirname)
+    
+    const watchPluginFiles = () => {
+      // Debounce reload to avoid multiple triggers
+      if (reloadTimer) {
+        clearTimeout(reloadTimer)
+      }
+      reloadTimer = setTimeout(() => {
+        log("setup: 🔄 Обнаружено изменение в файлах плагина, перезапуск...")
+        try {
+          context.reload?.()
+        } catch (e) {
+          // If reload() is not available, try direct kill
+          try {
+            process.exit(0)
+          } catch {}
+        }
+      }, 1000)
+    }
+
+    // Watch plugin files for changes
+    try {
+      if (fs.watch) {
+        fs.watch(pluginPath, (eventType, filename) => {
+          if (filename === 'index.js' || filename === 'tui.js' || filename === 'live.tsx') {
+            watchPluginFiles()
+          }
+        })
+      } else {
+        // Fallback: watch specific file
+        fs.watchFile(path.join(pluginPath, 'index.js'), { interval: 1000 }, () => {
+          watchPluginFiles()
+        })
+      }
+      log("setup: 📁 Наблюдение за файлами плагина включено")
+    } catch (e) {
+      log(`setup: ⚠️ Не удалось настроить автонаблюдение: ${e?.message}`)
+    }
+
     // This plugin is TUI-only. The server runtime also discovers plugins under
     // ~/.config/opencode/plugins but has no TUI APIs — no-op there.
     if (!context?.keymap || !context?.ui || !context?.storage) {
