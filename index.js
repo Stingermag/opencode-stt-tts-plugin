@@ -1934,52 +1934,78 @@ $audio.PlaySync()
         // the word (peak under threshold, window boundary, wakeBusy) while the
         // segment still transcribes it — and "заткнись" then lands in the chat
         // as a user message. This is the last line of defence for that.
+        //
+        // The old test was `onlyWake.startsWith(w + " ")` with NO length bound,
+        // so speaking the wake word and then continuing in the same breath —
+        // "мужик как дела" — matched it and the WHOLE message was silently
+        // dropped. A wake word is now peeled off the front instead; only what
+        // remains decides whether this was a bare command.
         const onlyWake = finalText.replace(/[.,!?…\s]/g, " ").trim()
-        const bareWake = wakeWords.some((w) => onlyWake === w || onlyWake.startsWith(`${w} `))
+        let messageText = finalText.trim()
+        let peeled = null
+        for (const w of wakeWords) {
+          const safe = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          // NB: NOT \b. In JS \b is ASCII-only ([A-Za-z0-9_]), so it never
+          // matches at a Cyrillic letter: "^мужик\b" does NOT match "мужик как",
+          // because "к" and the space are both non-word characters. That makes
+          // the rule silently never fire — measured, not assumed. The same trap
+          // is called out near HALLUCINATION_TRAILERS above.
+          // (?![\p{L}\p{N}]) is the Unicode-aware equivalent.
+          const m = messageText.match(new RegExp(`^${safe}(?![\\p{L}\\p{N}])[\\s,.:;\\-—–]*`, "i"))
+          if (m) { peeled = w; messageText = messageText.slice(m[0].length).replace(/\s+/g, " ").trim(); break }
+        }
+        const restOnly = messageText.replace(/[.,!?…\s]/g, " ").trim()
+        const restWords = restOnly ? restOnly.split(/\s+/).length : 0
+        // Nothing of substance left after peeling => it really was just the
+        // command. Two or more real words => the user was talking, send it.
+        const isBareCommand = !hasWords(restOnly) || restWords <= 1
         const bareMute = findMuteWord(onlyWake) !== null && onlyWake.split(/\s+/).length <= 3
-        if (bareWake || bareMute) {
+        if ((peeled && isBareCommand) || bareMute) {
           log(`hf: команда "${finalText.slice(0, 40)}" — не отправляю в чат`)
           if (!auto) toast("Голосовая команда — в чат не отправлена", "info")
           return
         }
+        if (peeled) {
+          log(`hf: снял слово-активатор "${peeled}", в чат уйдёт "${messageText.slice(0, 60)}"`)
+        }
         // whisper often answers a noise blip with punctuation only (".", "..", "—",
         // "..."). Those carry no words but pass the !finalText check and get
         // sent to the model as a message of pure punctuation.
-        if (!hasWords(finalText)) {
+        if (!hasWords(messageText)) {
           log(`hf: только пунктуация без слов, отброшено: "${res.text.slice(0, 60)}"`)
           if (!auto) toast("Распознан только шум — сообщение не отправлено", "warning")
           return
         }
-        if (isStandaloneHallucination(finalText) || isFillerOnlyMessage(finalText)) {
+        if (isStandaloneHallucination(messageText) || isFillerOnlyMessage(messageText)) {
           log(`hf: галлюцинация/пустышка отброшена: "${res.text.slice(0, 60)}"`)
           return
         }
         // The whole segment is our own TTS bouncing back through the speakers
         // — not the user speaking. Don't submit it as a message.
-        if (auto && isEchoOfSelf(finalText)) {
+        if (auto && isEchoOfSelf(messageText)) {
           log(`hf: эхо собственной озвучки отброшено: "${finalText.slice(0, 60)}"`)
           return
         }
         if (auto) {
           const sessionID = currentSessionID()
           if (!sessionID) {
-            if (await insertIntoComposer(finalText)) toast("Нет активной сессии — текст в поле ввода", "warning")
+            if (await insertIntoComposer(messageText)) toast("Нет активной сессии — текст в поле ввода", "warning")
             return
           }
           // Fire the turn without awaiting the LLM response.
-          toast(`Отправил: ${finalText.slice(0, 80)}`, "success", 2500)
-          context.client.session.prompt({ sessionID, text: finalText })
+          toast(`Отправил: ${messageText.slice(0, 80)}`, "success", 2500)
+          context.client.session.prompt({ sessionID, text: messageText })
             .catch((e) => log(`hf: prompt failed: ${e?.message || e}`))
           return
         }
         if (autoSubmit) {
-          await submit(finalText)
-        } else if (await insertIntoComposer(finalText)) {
+          await submit(messageText)
+        } else if (await insertIntoComposer(messageText)) {
           toast("Готово! Текст в поле ввода — Enter, чтобы отправить", "success")
         } else {
           const edited = await context.ui.dialog.prompt({
             title: "Голосовой ввод (Enter — отправить, Esc — отмена)",
-            value: finalText,
+            value: messageText,
           })
           if (edited && edited.trim()) await submit(edited.trim())
         }
