@@ -455,6 +455,27 @@ export default Plugin.define({
     // Set a positive "idleStop" in cli.json to get the old give-up behaviour.
     const idleStopRaw = Number(o.idleStop)
     const idleStop = Number.isFinite(idleStopRaw) && idleStopRaw >= 0 ? idleStopRaw : 0
+    // Wake-word latency knobs. These are the dominant cost in "мужик" -> heard:
+    // a tick has to fire before the word is even looked at, so the cadence is
+    // a direct addend to the response time (worst case = one full interval).
+    // Lower = snappier but more frequent file reads; whisper only runs when the
+    // peak gate passes, so the cost stays small. Keep the window (below) larger
+    // than the cadence or a short word can fall between two windows.
+    const wakeScanRaw = Number(o.wakeScanMs)
+    const wakeScanMs = Number.isFinite(wakeScanRaw) && wakeScanRaw >= 150 ? wakeScanRaw : 350
+    const wakeScanStandbyRaw = Number(o.wakeScanStandbyMs)
+    const wakeScanStandbyMs = Number.isFinite(wakeScanStandbyRaw) && wakeScanStandbyRaw >= 150 ? wakeScanStandbyRaw : 600
+    // Audio window handed to whisper for the wake check. Longer = slower whisper
+    // but a higher chance the whole word is inside one window.
+    const wakeWindowRaw = Number(o.wakeWindowSec)
+    const wakeWindowSec = Number.isFinite(wakeWindowRaw) && wakeWindowRaw >= 0.8 ? wakeWindowRaw : 2
+    // Grace period after killing the detector's own sox before re-opening the mic.
+    // This is a DEVICE-release delay, not politeness: waveaudio still holds the
+    // capture device for a moment after the process dies, and grabbing it sooner
+    // yields "Микрофон недоступен". Lower it only if you actually see that
+    // error; otherwise you are trading a rare failure for latency you barely feel.
+    const wakeDeviceMsRaw = Number(o.wakeDeviceMs)
+    const wakeDeviceMs = Number.isFinite(wakeDeviceMsRaw) && wakeDeviceMsRaw >= 0 ? wakeDeviceMsRaw : 400
     let lastVoiceAt = Date.now()
     // When the capture segment started and when playback last ended. Anything
     // recorded BETWEEN those two was the assistant's own voice coming back
@@ -609,10 +630,12 @@ export default Plugin.define({
         })
       }
       log(`wake: detector started (words: ${wakeWords.join(", ")}, ownSox=${!recording})`)
-      // Standby scans slower: the mic is deaf to everything but the wake word, so a
-      // 1s cadence only burns GPU and keeps the capture device busy. The word is
-      // several syllables long, so a 2s cadence still catches it reliably.
-      wakeTimer = setInterval(scanWakeAudio, standby ? 2000 : 1000)
+      // Cadence bounds the wake latency: a word can land just after a tick and then
+      // wait a whole interval before anyone looks. The pcmPeak gate in
+      // scanWakeAudio() rejects silence BEFORE whisper runs, so a short cadence
+      // costs a file read, not a GPU call. `wakeBusy` keeps ticks from piling up
+      // when a slow whisper scan overruns the interval.
+      wakeTimer = setInterval(scanWakeAudio, standby ? wakeScanStandbyMs : wakeScanMs)
     }
 
     function stopWakeDetector() {
@@ -647,11 +670,12 @@ export default Plugin.define({
       wakeBusy = true
       try {
         const st = fs.statSync(targetFile)
-        // Read the last 3 seconds. Two was too short: a short command like
-        // «заткнись» is well under 2s, so a scan landing just before the word
-        // started and the next one just after it ended saw neither — the mute
-        // was missed entirely.
-        const len = Math.min(SAMPLE_RATE * 2 * 3, st.size)
+        // Read the tail window (default 2s). Must stay comfortably LONGER than the
+        // scan cadence: otherwise a word can start just after the previous
+        // window ended and finish just before the next one begins, landing
+        // wholly outside both — that is what made short commands like
+        // «заткнись» get missed.
+        const len = Math.min(Math.floor(SAMPLE_RATE * 2 * wakeWindowSec), st.size)
         const buf = Buffer.alloc(len)
         const fd = fs.openSync(targetFile, "r")
         try { fs.readSync(fd, buf, 0, len, st.size - len) } finally { fs.closeSync(fd) }
@@ -779,7 +803,7 @@ export default Plugin.define({
               setTimeout(() => {
                 if (dead || recording) return
                 startRecording({ hfMode: true }).catch((e) => log(`wake: start error: ${e?.stack || e}`))
-              }, 400)
+              }, wakeDeviceMs)
             }
           } else {
             startRecording({ hfMode: false }).catch((e) => log(`wake: manual start error: ${e?.stack || e}`))
