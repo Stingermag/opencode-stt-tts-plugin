@@ -489,6 +489,10 @@ export default Plugin.define({
     // outside both (this is what used to swallow «заткнись»).
     const wakeWindowRaw = Number(o.wakeWindowSec)
     const wakeWindowSec = Number.isFinite(wakeWindowRaw) && wakeWindowRaw >= 0.8 ? wakeWindowRaw : 2
+    // Peak amplitude required before whisper is run at all. See the long note
+    // at its definition below — the value is wrong in either direction if you
+    // pick it by intuition.
+    const wakePeakMinRaw = Number(o.wakePeakMin)
     // Grace period after killing the detector's own sox before re-opening the mic.
     // Split from the process-exit wait: the old code slept a fixed 400ms because
     // killing the process does NOT release the device. Waiting for the actual
@@ -1026,11 +1030,21 @@ $audio.PlaySync()
     // chunk's echo arrives seconds after it was voiced. 12s lost the tail of a
     // long reply, letting the echo of the final sentences through.
     const SPOKEN_ECHO_TTL_MS = 60000
-    // Gate for running whisper on the wake window. Was 1500 and that was too high:
-// a quiet "заткнись" measured below it, the scan was skipped, the mute never
-// fired and the command went to the chat as a normal message. Whisper is the
-// real filter (isEchoOfSelf), so the gate only has to exclude true silence.
-    const SPEECH_PEAK_MIN = 300
+    // Gate for running whisper on the wake window, in s16 amplitude units (0..32767).
+    // History, because this number has been wrong in both directions:
+    //  - 1500 was tried and was too HIGH: a quiet «заткнись» measured below it,
+    //    the scan was skipped, the mute never fired, and the command went to
+    //    the chat as a normal message.
+    //  - 300 let through nearly everything: across 12385 real (peak, transcript)
+    //    pairs only 330 were genuine wake-word speech, 12055 were whisper
+    //    hallucinations ("музыка", "спасибо", ...) — so 97% of model invocations
+    //    were spent on noise.
+    // 1000 sits above the quiet-but-real band while still rejecting ~21% of the
+    // noise. Deliberately modest: amplitude cannot separate these two
+    // populations, since hallucination p95 peak (~17000) is far ABOVE the median
+    // genuine peak (~9200). A higher gate deletes real words before it removes
+    // much garbage. Tune with "wakePeakMin".
+    const SPEECH_PEAK_MIN = Number.isFinite(wakePeakMinRaw) && wakePeakMinRaw >= 0 ? wakePeakMinRaw : 1000
     // Fraction of heard words that must be ones WE just said before the window
     // counts as our own voice. 0.6 missed echoes where acoustic decay clipped
     // the start of the word; 0.5 still keeps a real interruption safe, since the
