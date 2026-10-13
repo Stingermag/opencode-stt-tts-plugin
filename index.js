@@ -537,7 +537,7 @@ export default Plugin.define({
       standby = true
       cancelAnswer()
       stopPlaybackSilently()
-      stopPlaybackSoxOnly()  // Остановить playbackSoxProc, так как не нужна озвучка
+      // playbackSoxProc НЕ останавливаем - он продолжает работать для возможной озвучки
       playBlip("off")
       toast(`Тишина. Жду слово "мужик".`, "info")
       if (hf.on || recording) stopHandsFree({ discard: true })
@@ -572,7 +572,8 @@ export default Plugin.define({
     // Оставляет playbackSoxProc работать постоянно
     // playbackSoxProc останавливается только через эту функцию
     function stopPlaybackSoxOnly() {
-      if (playbackSoxProc && !playbackSoxProc.killed) {
+      if (playbackSoxProc && !playbackSoxProc.killed && playbackSoxProc.exitCode === null && playbackSoxProc.killed === false) {
+        // Только убиваем если процесс действительно работает
         try {
           playbackSoxProc.kill()
           log(`speak: остановил playbackSoxProc pid=${playbackSoxProc.pid}`)
@@ -580,6 +581,8 @@ export default Plugin.define({
           log(`speak: ошибка при остановке playbackSoxProc: ${e?.message}`)
         }
         playbackSoxProc = null
+      } else {
+        log(`speak: playbackSoxProc уже завершился или killed=false, не останавливаем`)
       }
     }
 
@@ -1883,14 +1886,17 @@ $audio.PlaySync()
             return
           }
           // Используем постоянный playbackSoxProc для playback
-          if (playbackSoxProc) {
+          if (!playbackSoxProc || playbackSoxProc.killed) {
+            log('speak: playbackSoxProc не создан, создаем новый');
+          } else {
             // Отправляем путь к файлу в существующий процесс через stdin
             try {
               playbackSoxProc.stdin.write(`${rawPath}\n`)
               playbackSoxProc.stdin.end()
               log(`speak: отправил файл в playbackSoxProc pid=${playbackSoxProc.pid}`)
             } catch (e) {
-              log(`speak: не удалось отправить файл в playbackSoxProc: ${e?.message}, убиваем старый и создаем новый`)
+              log(`speak: не удалось отправить файл в playbackSoxProc: ${e?.message}, создаем новый`);
+              // Не убиваем процесс, создаем новый
               try { playbackSoxProc.kill() } catch {}
               playbackSoxProc = null
             }
