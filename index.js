@@ -572,17 +572,17 @@ export default Plugin.define({
     // Оставляет playbackSoxProc работать постоянно
     // playbackSoxProc останавливается только через эту функцию
     function stopPlaybackSoxOnly() {
-      if (playbackSoxProc && !playbackSoxProc.killed && playbackSoxProc.exitCode === null && playbackSoxProc.killed === false) {
-        // Только убиваем если процесс действительно работает
+      if (playbackSoxProc && playbackSoxProc.pid && playbackSoxProc.killed === false && playbackSoxProc.exitCode === null) {
+        log(`speak: 🛑 ОСТАНАВЛИВАЮ playbackSoxProc pid=${playbackSoxProc.pid}`)
         try {
           playbackSoxProc.kill()
-          log(`speak: остановил playbackSoxProc pid=${playbackSoxProc.pid}`)
+          log(`speak: 🛑 playbackSoxProc killed pid=${playbackSoxProc.pid}`)
+          playbackSoxProc = null
         } catch (e) {
-          log(`speak: ошибка при остановке playbackSoxProc: ${e?.message}`)
+          log(`speak: 🛑 ошибка при остановке playbackSoxProc: ${e?.message}`)
         }
-        playbackSoxProc = null
       } else {
-        log(`speak: playbackSoxProc уже завершился или killed=false, не останавливаем`)
+        log(`speak: 🛑 playbackSoxProc pid=${playbackSoxProc?.pid || 'null'} уже завершился или killed=false, не останавливаем`)
       }
     }
 
@@ -1885,48 +1885,58 @@ $audio.PlaySync()
             done()
             return
           }
-          // Используем постоянный playbackSoxProc для playback
-          // Если не создан - создаем ОДИН РАЗ и навсегда
+          // Создаем playbackSoxProc ПЕРВЫЙ И ПОСЛЕДНИЙ РАЗ - навсегда
           if (!playbackSoxProc || playbackSoxProc.killed || playbackSoxProc.exitCode !== null) {
-            // Создаем playbackSoxProc ОДИН РАЗ - только если он не создан или завершен
-            if (!playbackSoxProc || playbackSoxProc.killed || playbackSoxProc.exitCode !== null) {
-              log('speak: создаю playbackSoxProc ПЕРВЫЙ РАЗ')
+            if (!playbackSoxProc) {
+              log('speak: ✨ Создаю playbackSoxProc ПЕРВЫЙ РАЗ НАВСЕГДА')
               playbackSoxProc = spawn(soxBin, [
                 "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
               ], { windowsHide: true })
+
               playbackSoxProc.on("error", (e) => {
-                log(`speak: playbackSoxProc error ${e?.message || e}`)
+                log(`speak: ✨ playbackSoxProc error ${e?.message || e}`)
               })
+
               playbackSoxProc.on("close", (code) => {
-                log(`speak: playbackSoxProc закрыт код=${code}, это первый и последний раз, больше не создаю новый`)
-                // playbackSoxProc = null сохраняется, чтобы процесс был убит через stopPlaybackSoxOnly()
+                log(`speak: ✨ playbackSoxProc закрыт код=${code}, ОСТАВЛЯЕТСЯ null чтобы его убили через stopPlaybackSoxOnly()`)
+                // НЕ восстанавливаем playbackSoxProc - пусть он будет null
+                // Он будет убит через stopPlaybackSoxOnly()
               })
-              log(`speak: создал playbackSoxProc pid=${playbackSoxProc.pid}`)
+
+              log(`speak: ✨ Создан playbackSoxProc pid=${playbackSoxProc.pid} - больше не создаю новых`)
             }
           }
 
-          // Теперь отправляем файл в playbackSoxProc
-          try {
-            playbackSoxProc.stdin.write(`${rawPath}\n`)
-            playbackSoxProc.stdin.end()
-            log(`speak: отправил файл в playbackSoxProc pid=${playbackSoxProc.pid}`)
-          } catch (e) {
-            log(`speak: не удалось отправить файл в playbackSoxProc: ${e?.message}`)
-            // Если не удалось - это первый раз, создадим заново для этого файла
-            if (!playbackSoxProc) {
-              log('speak: retry: создаю временный playbackSoxProc для этого файла')
+          // Отправляем файл в playbackSoxProc
+          if (!playbackSoxProc || playbackSoxProc.killed) {
+            log('speak: ⚠️ playbackSoxProc отсутствует, создаю временный только для этого файла')
+            const tempSox = spawn(soxBin, [
+              "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
+              rawPath,
+              "-t", "waveaudio", "-d",
+            ], { windowsHide: true })
+            tempSox.on("close", () => {
+              log('speak: ⚠️ временный playbackSoxProc закрыт')
+              // playbackSoxProc останется null, будет убит через stopPlaybackSoxOnly()
+            })
+            try { tempSox.stdin.write(`${rawPath}\n`); tempSox.stdin.end(); } catch {}
+          } else {
+            try {
+              playbackSoxProc.stdin.write(`${rawPath}\n`)
+              playbackSoxProc.stdin.end()
+              log(`speak: ✅ отправил файл в playbackSoxProc pid=${playbackSoxProc.pid}`)
+            } catch (e) {
+              log(`speak: ❌ не удалось отправить файл в playbackSoxProc: ${e?.message}`)
+              // Ошибка - создаем временный для этого файла
               const tempSox = spawn(soxBin, [
                 "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
                 rawPath,
                 "-t", "waveaudio", "-d",
               ], { windowsHide: true })
               tempSox.on("close", () => {
-                playbackSoxProc = null
+                log('speak: ❌ временный playbackSoxProc закрыт')
               })
               try { tempSox.stdin.write(`${rawPath}\n`); tempSox.stdin.end(); } catch {}
-            } else {
-              try { playbackSoxProc.kill(); } catch {}
-              playbackSoxProc = null
             }
           }
 
