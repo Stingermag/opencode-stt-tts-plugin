@@ -315,8 +315,15 @@ export default Plugin.define({
     const bargeInEnabled = o.bargeIn === true
     // TTS speaking rate: piper length_scale (1.0 = default speed; lower is
     // faster) and the silence piper inserts between sentences, in seconds.
+    // Measured on ru_RU-dmitri-medium, 85-char sentence, real clip durations:
+    //   1.00 -> 5.16s (1.00x)   0.85 -> 4.92s (1.05x)
+    //   0.70 -> 4.23s (1.22x)   0.60 -> 3.87s (1.33x)
+    //   0.50 -> 3.66s (1.41x)
+    // Returns flatten below 0.6 while artefacts grow, so that is the knee.
+    // NOTE: cli.json sets ttsLengthScale explicitly and OVERRIDES this default —
+    // keep the two in sync or the value here silently does nothing.
     const ttsLengthScaleRaw = Number(o.ttsLengthScale)
-    const ttsLengthScale = Number.isFinite(ttsLengthScaleRaw) && ttsLengthScaleRaw >= 0.3 && ttsLengthScaleRaw <= 2 ? ttsLengthScaleRaw : 0.7
+    const ttsLengthScale = Number.isFinite(ttsLengthScaleRaw) && ttsLengthScaleRaw >= 0.3 && ttsLengthScaleRaw <= 2 ? ttsLengthScaleRaw : 0.6
     const ttsSentenceSilenceRaw = Number(o.ttsSentenceSilence)
     const ttsSentenceSilence = Number.isFinite(ttsSentenceSilenceRaw) && ttsSentenceSilenceRaw >= 0 ? ttsSentenceSilenceRaw : 0.05
     // Trailing silence (seconds) appended to every generated clip. On Windows,
