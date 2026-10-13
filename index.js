@@ -243,9 +243,7 @@ export default Plugin.define({
       return
     }
 
-    // Additional safety check
-    try {
-      log("setup: TUI runtime, registering commands")
+    log("setup: TUI runtime, registering commands")
     const o = context.options ?? {}
     log(`TUI options keys: ${JSON.stringify(Object.keys(o))} (sttLanguage=${o.sttLanguage ?? "unset"}, cudaBin=${o.cudaBin ?? "unset"}, whisperCli=${o.whisperCli ?? "unset"}, whisperDevice=${o.whisperDevice ?? "unset"}, llmModel=${o.llmModel ?? "unset"}, llmKeepAlive=${o.llmKeepAlive ?? "unset"})`)
     const soxBin = o.sox || "sox"
@@ -428,8 +426,6 @@ export default Plugin.define({
     let rawFile = null
     let playback = null
     let lastSpoken = null
-    // Постоянный такс для TTS playback (не убиваем автоматически)
-    let playbackSoxProc = null
     // Echo gate: ttsActive is true from the moment speak() starts until playback
     // fully ends; ttsEndAt adds a short cooldown after so the tail of the last
     // word (still ringing in the room) can't be heard as fresh speech. While
@@ -543,7 +539,6 @@ export default Plugin.define({
       standby = true
       cancelAnswer()
       stopPlaybackSilently()
-      // playbackSoxProc НЕ останавливаем - он продолжает работать для возможной озвучки
       playBlip("off")
       toast(`Тишина. Жду слово "мужик".`, "info")
       if (hf.on || recording) stopHandsFree({ discard: true })
@@ -554,42 +549,30 @@ export default Plugin.define({
       }, 300)
     }
 
-    // stopPlayback() - останавливает Piper, но оставляет playbackSoxProc работать
+    // stopPlayback() opens a new post-listen window; entering standby must not.
     function stopPlaybackSilently() {
       if (!playback) return
       try { playback.piper.kill() } catch {}
-      // playbackSoxProc не убиваем - он работает постоянно
+      try { playback.sox.kill() } catch {}
       ttsEndAt = Date.now() + TTS_ECHO_COOLDOWN_MS
       postListenUntil = 0
+      playback = null
     }
 
     function stopPlayback() {
       if (!playback) return
       try { playback.piper.kill() } catch {}
-      // playbackSoxProc не убиваем - он работает постоянно
+      try { playback.sox.kill() } catch {}
       // Echo gate: playback is dead, but the last word still rings in the room.
       // Keep the mic deaf for a short cooldown so the echo tail can't be heard
       // as fresh speech.
       ttsEndAt = Date.now() + TTS_ECHO_COOLDOWN_MS
       // …then open the listen window so the mic picks the user up again.
       openPostListen()
-    }
-
-    // Оставляет playbackSoxProc работать постоянно
-    // playbackSoxProc останавливается только через эту функцию
-    function stopPlaybackSoxOnly() {
-      if (playbackSoxProc && playbackSoxProc.pid && playbackSoxProc.killed === false && playbackSoxProc.exitCode === null) {
-        log(`speak: 🛑 ОСТАНАВЛИВАЮ playbackSoxProc pid=${playbackSoxProc.pid}`)
-        try {
-          playbackSoxProc.kill()
-          log(`speak: 🛑 playbackSoxProc killed pid=${playbackSoxProc.pid}`)
-          playbackSoxProc = null
-        } catch (e) {
-          log(`speak: 🛑 ошибка при остановке playbackSoxProc: ${e?.message}`)
-        }
-      } else {
-        log(`speak: 🛑 playbackSoxProc pid=${playbackSoxProc?.pid || 'null'} уже завершился или killed=false, не останавливаем`)
-      }
+      playback = null
+      // NB: the wake-word detector stays armed — it must listen before, during
+      // and after playback so "стоп"/"мужик" works at any moment. Stopping it
+      // here left the detector dead after every TTS reply.
     }
 
     // Wake-word detector: always-on when the mic is armed. Captures the mic into
@@ -1891,70 +1874,15 @@ $audio.PlaySync()
             done()
             return
           }
-          // Создаем playbackSoxProc ПЕРВЫЙ РАЗ - навсегда
-          let tempSox = null
-          // Создаем playbackSoxProc один раз
-          let playbackSoxCreated = false
-
-          if (!playbackSoxProc || playbackSoxProc.killed) {
-            if (!playbackSoxProc && !playbackSoxCreated) {
-              log('speak: создаю playbackSoxProc первый раз')
-              playbackSoxProc = spawn(soxBin, [
-                "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
-              ], { windowsHide: true })
-
-              playbackSoxProc.on("error", (e) => {
-                log(`speak: playbackSoxProc error ${e?.message || e}`)
-              })
-
-              playbackSoxProc.on("close", (code) => {
-                log(`speak: playbackSoxProc закрыт код=${code}`)
-                playbackSoxCreated = false
-              })
-
-              playbackSoxCreated = true
-              log(`speak: создал playbackSoxProc pid=${playbackSoxProc.pid}`)
-            }
-          }
-
-          // Отправляем файл
-          if (!playbackSoxProc || playbackSoxProc.killed) {
-            log('speak: playbackSoxProc не существует, создаю временный')
-            const temp = spawn(soxBin, [
-              "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
-              rawPath,
-              "-t", "waveaudio", "-d",
-            ], { windowsHide: true })
-            temp.on("close", () => {
-              // temp закрыт
-            })
-            try {
-              temp.stdin.write(`${rawPath}\n`)
-              temp.stdin.end()
-            } catch {}
-          } else {
-            try {
-              playbackSoxProc.stdin.write(`${rawPath}\n`)
-              playbackSoxProc.stdin.end()
-              log(`speak: отправил файл в playbackSoxProc pid=${playbackSoxProc.pid}`)
-            } catch (e) {
-              log(`speak: ошибка отправки: ${e?.message}`)
-              const temp = spawn(soxBin, [
-                "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
-                rawPath,
-                "-t", "waveaudio", "-d",
-              ], { windowsHide: true })
-              temp.on("close", () => {
-                // temp закрыт
-              })
-              try {
-                temp.stdin.write(`${rawPath}\n`)
-                temp.stdin.end()
-              } catch {}
-            }
-          }
-
-          mine.sox = playbackSoxProc
+          // Один sox на один клип. У sox нет демон-режима: без файла и без
+          // "-t waveaudio -d" он читает stdin и выбрасывает звук, поэтому
+          // держать один процесс и подсовывать ему файлы невозможно.
+          const sox = spawn(soxBin, [
+            "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
+            rawPath,
+            "-t", "waveaudio", "-d",
+          ], { windowsHide: true })
+          mine.sox = sox
           playingSince = Date.now()
           // Duration of what sox is about to play, so the mic can be armed a
           // moment before the last word instead of after it.
@@ -1964,6 +1892,15 @@ $audio.PlaySync()
           bargeLoudTicks = 0
 
           const cleanup = () => { try { fs.unlinkSync(rawPath) } catch {} }
+          log(`speak: sox-play pid=${sox.pid} (file), rate=${rate}`)
+          sox.on("close", (code) => {
+            log(`speak: sox-play closed code=${code}`)
+            if (active()) playback = null
+            cleanup()
+            done()
+          })
+          sox.on("error", (e) => { log(`speak: sox-play error ${e?.message || e}`); cleanup(); done() })
+        }
       })
     }
 
@@ -2744,7 +2681,6 @@ $audio.PlaySync()
       releaseLive()
       if (soxProc) { try { soxProc.kill() } catch {} }
       stopPlayback()
-      stopPlaybackSoxOnly()  // Остановить playbackSoxProc при выходе из плагина
     }
   },
 })
