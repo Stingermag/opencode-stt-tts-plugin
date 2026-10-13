@@ -233,47 +233,6 @@ function wrapRawToWav(rawPath, wavPath, rate) {
 export default Plugin.define({
   id: "voice",
   setup(context) {
-    // Auto-reload plugin when files change
-    let reloadTimer = null
-    const pluginPath = path.resolve(__dirname)
-    
-    const watchPluginFiles = () => {
-      // Debounce reload to avoid multiple triggers
-      if (reloadTimer) {
-        clearTimeout(reloadTimer)
-      }
-      reloadTimer = setTimeout(() => {
-        log("setup: 🔄 Обнаружено изменение в файлах плагина, перезапуск...")
-        try {
-          context.reload?.()
-        } catch (e) {
-          // If reload() is not available, try direct kill
-          try {
-            process.exit(0)
-          } catch {}
-        }
-      }, 1000)
-    }
-
-    // Watch plugin files for changes
-    try {
-      if (fs.watch) {
-        fs.watch(pluginPath, (eventType, filename) => {
-          if (filename === 'index.js' || filename === 'tui.js' || filename === 'live.tsx') {
-            watchPluginFiles()
-          }
-        })
-      } else {
-        // Fallback: watch specific file
-        fs.watchFile(path.join(pluginPath, 'index.js'), { interval: 1000 }, () => {
-          watchPluginFiles()
-        })
-      }
-      log("setup: 📁 Наблюдение за файлами плагина включено")
-    } catch (e) {
-      log(`setup: ⚠️ Не удалось настроить автонаблюдение: ${e?.message}`)
-    }
-
     // This plugin is TUI-only. The server runtime also discovers plugins under
     // ~/.config/opencode/plugins but has no TUI APIs — no-op there.
     if (!context?.keymap || !context?.ui || !context?.storage) {
@@ -1928,11 +1887,12 @@ $audio.PlaySync()
           }
           // Создаем playbackSoxProc ПЕРВЫЙ РАЗ - навсегда
           let tempSox = null
-          let createdPlaybackSoxProc = false
-          
-          if (!playbackSoxProc || playbackSoxProc.killed || playbackSoxProc.exitCode !== null) {
-            if (!playbackSoxProc && !createdPlaybackSoxProc) {
-              log('speak: Создаю playbackSoxProc ПЕРВЫЙ РАЗ')
+          // Создаем playbackSoxProc один раз
+          let playbackSoxCreated = false
+
+          if (!playbackSoxProc || playbackSoxProc.killed) {
+            if (!playbackSoxProc && !playbackSoxCreated) {
+              log('speak: создаю playbackSoxProc первый раз')
               playbackSoxProc = spawn(soxBin, [
                 "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
               ], { windowsHide: true })
@@ -1943,28 +1903,28 @@ $audio.PlaySync()
 
               playbackSoxProc.on("close", (code) => {
                 log(`speak: playbackSoxProc закрыт код=${code}`)
-                createdPlaybackSoxProc = false
+                playbackSoxCreated = false
               })
 
-              createdPlaybackSoxProc = true
-              log(`speak: Создан playbackSoxProc pid=${playbackSoxProc.pid}`)
+              playbackSoxCreated = true
+              log(`speak: создал playbackSoxProc pid=${playbackSoxProc.pid}`)
             }
           }
 
-          // Отправляем файл в playbackSoxProc или создаем временный
+          // Отправляем файл
           if (!playbackSoxProc || playbackSoxProc.killed) {
-            log('speak: playbackSoxProc отсутствует, создаю ВРЕМЕННЫЙ')
-            tempSox = spawn(soxBin, [
+            log('speak: playbackSoxProc не существует, создаю временный')
+            const temp = spawn(soxBin, [
               "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
               rawPath,
               "-t", "waveaudio", "-d",
             ], { windowsHide: true })
-            tempSox.on("close", () => {
-              tempSox = null
+            temp.on("close", () => {
+              // temp закрыт
             })
             try {
-              tempSox.stdin.write(`${rawPath}\n`)
-              tempSox.stdin.end()
+              temp.stdin.write(`${rawPath}\n`)
+              temp.stdin.end()
             } catch {}
           } else {
             try {
@@ -1972,18 +1932,18 @@ $audio.PlaySync()
               playbackSoxProc.stdin.end()
               log(`speak: отправил файл в playbackSoxProc pid=${playbackSoxProc.pid}`)
             } catch (e) {
-              log(`speak: не удалось отправить файл в playbackSoxProc: ${e?.message}, создаю ВРЕМЕННЫЙ`)
-              tempSox = spawn(soxBin, [
+              log(`speak: ошибка отправки: ${e?.message}`)
+              const temp = spawn(soxBin, [
                 "-t", "raw", "-r", String(rate), "-e", "signed-integer", "-b", "16", "-c", "1",
                 rawPath,
                 "-t", "waveaudio", "-d",
               ], { windowsHide: true })
-              tempSox.on("close", () => {
-                tempSox = null
+              temp.on("close", () => {
+                // temp закрыт
               })
               try {
-                tempSox.stdin.write(`${rawPath}\n`)
-                tempSox.stdin.end()
+                temp.stdin.write(`${rawPath}\n`)
+                temp.stdin.end()
               } catch {}
             }
           }
