@@ -440,6 +440,13 @@ export default Plugin.define({
     // detector has to stay alive — killing it with stopHandsFree() made the
     // next «мужик» unreachable, so the bot could never be woken again.
     let standby = false
+    // True when hands-free was armed by an explicit keypress (toggleHandsFree),
+    // false when it was woken by the wake word. Deliberate arming is sticky —
+    // it survives until the user turns it off, so the idle watchdog must not
+    // quietly release the mic a few seconds after the hotkey. A wake word is
+    // only a momentary "I'm back" and still releases on silence, otherwise the
+    // capture device stays open indefinitely after a stray «мужик».
+    let hfManual = false
     // Did anyone actually speak inside the post-TTS window? If the window runs
     // out untouched, the bot goes to standby instead of waiting for a segment
     // that will never contain a word.
@@ -447,14 +454,14 @@ export default Plugin.define({
     // Set for one tick when the post-listen window times out.
     let postListenExpired = false
     // Idle watchdog: after this many seconds with no detected speech the mic
-    // gives up and waits for the wake word, instead of transcribing an empty
-    // room indefinitely. 0 disables it — the DEFAULT, because a hands-free
-    // session that silently drops to standby ~5s after you press the hotkey
-    // reads as "the toggle didn't take". Segments still finalize on their own
-    // via the VAD silence gate below; this only governed going to standby.
-    // Set a positive "idleStop" in cli.json to get the old give-up behaviour.
+    // gives up and waits for the wake word, instead of holding the capture
+    // device open on an empty room. Counts from the last detected speech, so
+    // it never fires mid-dictation. Only applies to wake-word arming — see
+    // hfManual; a deliberate hotkey press is exempt. 0 disables it entirely.
+    // Segments still finalize on their own via the VAD silence gate below;
+    // this only governs going to standby.
     const idleStopRaw = Number(o.idleStop)
-    const idleStop = Number.isFinite(idleStopRaw) && idleStopRaw >= 0 ? idleStopRaw : 0
+    const idleStop = Number.isFinite(idleStopRaw) && idleStopRaw >= 0 ? idleStopRaw : 5
     // Wake-word latency knobs. These are the dominant cost in "мужик" -> heard:
     // a tick has to fire before the word is even looked at, so the cadence is
     // a direct addend to the response time (worst case = one full interval).
@@ -757,6 +764,11 @@ export default Plugin.define({
           const playing = ttsActive || Date.now() < ttsEndAt
           const wasStandby = standby
           standby = false
+          // A wake word is a transient wake, not a standing order to record:
+          // the idle watchdog applies again so a stray «мужик» doesn't hold the
+          // capture device open forever. An explicit hotkey arming sets this
+          // back to true.
+          hfManual = false
           log(`wake: ключевое слово "${hit}" (playing=${playing}, standby=${wasStandby}) — останавливаю озвучку и начинаю диктовку`)
           // Short confirmation blip so the user knows the keyword was detected.
           playBlip("on")
@@ -1408,7 +1420,9 @@ $audio.PlaySync()
           // Idle watchdog. Placed AFTER the post-listen branches so a freshly opened
           // window is never cut short, and before segment finalization so an
           // empty room doesn't keep a capture process alive indefinitely.
-          if (idleStop > 0 && !playing && !standby && now - lastVoiceAt >= idleStop * 1000) {
+          // hfManual arms are exempt — releasing the mic seconds after an
+          // explicit hotkey press reads as "the toggle didn't take".
+          if (idleStop > 0 && !hfManual && !playing && !standby && now - lastVoiceAt >= idleStop * 1000) {
             enterStandby(`нет речи ${idleStop}с`)
             return
           }
@@ -1548,6 +1562,9 @@ $audio.PlaySync()
       // auto-resume intent along with the actual state.
       setState((draft) => { draft.hfWanted = false })
       setHf((d) => { d.on = false })
+      // Next hands-free session starts as a wake-word session until the user
+      // presses the hotkey, so the idle watchdog governs it.
+      hfManual = false
       toast("Hands-free выключен", "info")
       const proc = soxProc
       const rf = rawFile
@@ -1572,6 +1589,8 @@ $audio.PlaySync()
       // keep competing with the recording we are about to start.
       standby = false
       stopWakeDetector()
+      // Deliberate arming: sticky, exempt from the idle watchdog.
+      hfManual = true
       setState((draft) => { draft.hfWanted = true })
       setHf((d) => { d.on = true })
       toast(`Hands-free: говорите, пауза ${hfSilence} с → авто-отправка в чат. Ctrl+Alt+Space — выкл`, "success")
