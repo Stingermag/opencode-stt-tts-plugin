@@ -359,25 +359,48 @@ export default Plugin.define({
     // while it runs. Off by default only when explicitly set to false.
     const stepsTTS = o.stepsTTS !== false
     // Spoken right after the user's message is accepted (execution.started),
-    // before the reply streams — e.g. "Принял, обрабатываю". Set to "" to disable.
+    // before the reply streams. Set to "" to disable.
     // A list of phrases (separated by "|") is picked at random each time, so the
     // acknowledgment doesn't sound like a stuck record.
+    //
+    // WHY THESE ARE ALL ONE SHORT WORD: the ack holds the whole answer behind it
+    // (see ackBusy below), so its length IS added to the wait before the
+    // narrator starts speaking. Measured on ru_RU-dmitri-medium at scale 1.05:
+    //   "Принял, обрабатываю"  1407ms   <- the old set averaged ~1.4s
+    //   "ага" 374  "ок" 351  "угу" 363  "так" 328  "да" 316  "жду" 339
+    //   "вижу" 734  "ясно" 734  "понял" 711  "принял" 722  "ладно" 781
+    //   "хорошо" 781  "окей" 746
+    // Nothing can go below ~300ms: that is piper loading the voice model, and it
+    // happens per speak() call. So ~350ms is effectively the floor, not zero.
+    //
+    // CAVEAT: the shortest entries are also the most common Russian words. If
+    // you dictate a bare "да"/"ага" right after sending a message, the echo
+    // filter (isEchoOfSelf, which drops transcripts matching what we just voiced)
+    // can score it as our own echo and discard a real utterance. Raise
+    // ECHO_MATCH or shorten the spoken-TTL if you ever see that.
     const ACK_DEFAULT = [
-      "Принял, обрабатываю",
-      "Сейчас сделаю",
-      "Понял, работаю",
-      "Хорошо, берусь",
-      "Уже думаю над этим",
-      "Принято",
-      "Окей, лету",
-      "Да, конечно",
-      "Секунду, смотрю",
-      "Понятно, в деле",
+      "ага",
+      "ок",
+      "окей",
+      "угу",
+      "так",
+      "да",
+      "жду",
+      "вижу",
+      "ясно",
+      "понял",
+      "принял",
+      "ладно",
+      "хорошо",
     ]
+    // "Принял, обрабатываю" is the historical sentinel value in cli.json that
+    // selects this built-in list. Kept as a literal so existing configs keep
+    // resolving to the defaults even though the phrase itself is gone.
+    const ACK_LIST_SENTINEL = "Принял, обрабатываю"
     const ackPhrases = (() => {
       const raw = String(o.ackPhrase ?? "").trim()
       if (raw === "") return []
-      const list = (raw === "Принял, обрабатываю" ? ACK_DEFAULT.join("|") : raw).split("|").map((p) => p.trim()).filter(Boolean)
+      const list = (raw === ACK_LIST_SENTINEL ? ACK_DEFAULT.join("|") : raw).split("|").map((p) => p.trim()).filter(Boolean)
       return list
     })()
     // Wake words that stop TTS playback when spoken during it. Comma-separated.
@@ -500,6 +523,10 @@ export default Plugin.define({
     // at its definition below — the value is wrong in either direction if you
     // pick it by intuition.
     const wakePeakMinRaw = Number(o.wakePeakMin)
+    // Cadence for sampling the streaming assistant text. Half the old 500ms,
+    // which halves the average detection delay for a finished sentence.
+    const streamPollRaw = Number(o.streamPollMs)
+    const streamPollMs = Number.isFinite(streamPollRaw) && streamPollRaw >= 100 ? streamPollRaw : 250
     // Grace period after killing the detector's own sox before re-opening the mic.
     // Split from the process-exit wait: the old code slept a fixed 400ms because
     // killing the process does NOT release the device. Waiting for the actual
@@ -2292,7 +2319,12 @@ $audio.PlaySync()
     function startStreamPoll(sessionID) {
       if (!sessionID || streamPoll || dead) return
       pollLogTicks = 0
-      streamPoll = setInterval(() => { streamPollTick(sessionID).catch(() => {}) }, 500)
+      // How often the assistant text is sampled for newly-spoken sentences.
+      // This is the cadence floor on "answer appeared -> narrator speaks": a
+      // completed sentence is invisible until the next tick, so the wait is
+      // uniform 0..streamPollMs, averaging half of it. Pure reads of session
+      // state, so the cost is small. Tune with "streamPollMs".
+      streamPoll = setInterval(() => { streamPollTick(sessionID).catch(() => {}) }, streamPollMs)
     }
 
     // Streaming unit is a whole MESSAGE's joined text, keyed by MESSAGE id.
