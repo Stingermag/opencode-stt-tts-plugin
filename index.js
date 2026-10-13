@@ -448,9 +448,13 @@ export default Plugin.define({
     let postListenExpired = false
     // Idle watchdog: after this many seconds with no detected speech the mic
     // gives up and waits for the wake word, instead of transcribing an empty
-    // room indefinitely. 0 disables it.
+    // room indefinitely. 0 disables it — the DEFAULT, because a hands-free
+    // session that silently drops to standby ~5s after you press the hotkey
+    // reads as "the toggle didn't take". Segments still finalize on their own
+    // via the VAD silence gate below; this only governed going to standby.
+    // Set a positive "idleStop" in cli.json to get the old give-up behaviour.
     const idleStopRaw = Number(o.idleStop)
-    const idleStop = Number.isFinite(idleStopRaw) && idleStopRaw >= 0 ? idleStopRaw : 5
+    const idleStop = Number.isFinite(idleStopRaw) && idleStopRaw >= 0 ? idleStopRaw : 0
     let lastVoiceAt = Date.now()
     // When the capture segment started and when playback last ended. Anything
     // recorded BETWEEN those two was the assistant's own voice coming back
