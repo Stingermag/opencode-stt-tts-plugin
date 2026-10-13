@@ -484,12 +484,22 @@ export default Plugin.define({
     const wakeWindowRaw = Number(o.wakeWindowSec)
     const wakeWindowSec = Number.isFinite(wakeWindowRaw) && wakeWindowRaw >= 0.8 ? wakeWindowRaw : 2
     // Grace period after killing the detector's own sox before re-opening the mic.
-    // This is a DEVICE-release delay, not politeness: waveaudio still holds the
-    // capture device for a moment after the process dies, and grabbing it sooner
-    // yields "Микрофон недоступен". Lower it only if you actually see that
-    // error; otherwise you are trading a rare failure for latency you barely feel.
+    // Split from the process-exit wait: the old code slept a fixed 400ms because
+    // killing the process does NOT release the device. Waiting for the actual
+    // 'close' event (killAndWait) covers the process itself in tens of ms, and
+    // all that is left is this short driver-release grace.
+    // Set wakeDeviceMs: 0 to sleep blind instead (the old behaviour) if your
+    // device really does need the longer settle, e.g. if you see "Микрофон
+    // недоступен" after lowering wakeGraceMs.
+    const wakeGraceMsRaw = Number(o.wakeGraceMs)
+    const wakeGraceMs = Number.isFinite(wakeGraceMsRaw) && wakeGraceMsRaw >= 0 ? wakeGraceMsRaw : 100
+    // Upper bound on the process-exit wait, so a stuck sox degrades to a short
+    // delay rather than freezing dictation for the full 2s hang guard.
+    const wakeExitMsRaw = Number(o.wakeExitMs)
+    const wakeExitMs = Number.isFinite(wakeExitMsRaw) && wakeExitMsRaw >= 50 ? wakeExitMsRaw : 500
+    // Legacy: explicit blind sleep. >0 makes the wake path use it verbatim.
     const wakeDeviceMsRaw = Number(o.wakeDeviceMs)
-    const wakeDeviceMs = Number.isFinite(wakeDeviceMsRaw) && wakeDeviceMsRaw >= 0 ? wakeDeviceMsRaw : 400
+    const wakeDeviceMs = Number.isFinite(wakeDeviceMsRaw) && wakeDeviceMsRaw >= 0 ? wakeDeviceMsRaw : 0
     // Blip tones. Kept deliberately BELOW the speech formant band: formants that
     // carry intelligibility sit roughly at F1 300-800 Hz and F2 800-2500 Hz, so
     // a tone down there is what the mic hands straight to whisper as if it were
@@ -829,17 +839,31 @@ export default Plugin.define({
                 startRecording({ hfMode: true }).catch((e) => log(`wake: restart error: ${e?.stack || e}`))
               })
             } else {
-              // Leaving standby: kill the detector's own sox first, otherwise it
-              // keeps the capture device alongside the segment recorder (two
-              // processes on one mic). The delay matters: stopWakeDetector()
-              // kills the process but does not wait for the driver to release
-              // the device, and starting immediately produced "Микрофон
-              // недоступен" errors on waveaudio.
+              // Leaving standby: the detector's own sox holds the capture
+              // device, so it must be gone before the segment recorder can
+              // open it. Grab the handle BEFORE stopWakeDetector() nulls it,
+              // then wait for the real 'close' event instead of sleeping a
+              // fixed 400ms — a killed sox exits in tens of ms, so the fixed
+              // sleep was pure dead time on the user's first syllable. Only a
+              // short driver-release grace remains on top.
+              const wakeProcToKill = wakeProc
               stopWakeDetector()
-              setTimeout(() => {
-                if (dead || recording) return
-                startRecording({ hfMode: true }).catch((e) => log(`wake: start error: ${e?.stack || e}`))
-              }, wakeDeviceMs)
+              const wakeDetectedAt = Date.now()
+              const beginRecording = () => {
+                setTimeout(() => {
+                  if (dead || recording) return
+                  log(`wake: микрофон открываю через ${Date.now() - wakeDetectedAt}мс от распознавания`)
+                  startRecording({ hfMode: true }).catch((e) => log(`wake: start error: ${e?.stack || e}`))
+                }, wakeDeviceMs > 0 ? wakeDeviceMs : wakeGraceMs)
+              }
+              if (wakeDeviceMs > 0) {
+                // Explicit legacy blind sleep requested.
+                beginRecording()
+              } else if (wakeProcToKill) {
+                killAndWait(wakeProcToKill, wakeExitMs).then(beginRecording)
+              } else {
+                beginRecording()
+              }
             }
           } else {
             startRecording({ hfMode: false }).catch((e) => log(`wake: manual start error: ${e?.stack || e}`))
@@ -1626,12 +1650,13 @@ $audio.PlaySync()
       startRecording({ hfMode: true }).catch((e) => log(`hf start error: ${e?.stack || e}`))
     }
 
-    function killAndWait(proc) {
+    function killAndWait(proc, timeoutMs = 2000) {
       return new Promise((resolve) => {
         if (!proc) return resolve()
         proc.once("close", resolve)
         try { proc.kill() } catch { resolve() }
-        setTimeout(resolve, 2000)
+        // Hang guard only — the "close" event normally lands within tens of ms.
+        setTimeout(resolve, timeoutMs)
       })
     }
 
