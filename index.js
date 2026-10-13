@@ -501,11 +501,14 @@ export default Plugin.define({
     // restarting from a trim offset is the only option that works with no
     // external dependency.
     //
-    // CAVEAT, and it matters: through speakers the narrator hears ITSELF. The
-    // code elsewhere records speaker-echo peaks of 20000-30000, so a threshold
-    // low enough to catch a real noise is also reachable by the bot's own voice
-    // and it will pause itself. Use headphones, or set the threshold well above
-    // your echo floor.
+    // CAVEAT, and it matters: through speakers the narrator hears ITSELF. Measured
+    // over 8242 mic-peak samples taken while audio was actually playing:
+    // p50=1228, p90=6820, p99=23427. So 12000 is above the routine echo floor
+    // but below the echo tail — about 4.7% of in-playback ticks reach it, and
+    // requiring 2 in a row puts the accidental-pause odds at roughly 2% per
+    // 10s of narration. The old 20000 with 3 ticks was effectively never
+    // triggered (1.8%^3 per tick), which is why interrupting simply did not
+    // work. With headphones the false-positive risk disappears entirely.
     let pauseHook = null          // set by the active speak() to pause its clip
     let pauseTicks = 0            // consecutive loud VAD ticks before pausing
     const ttsPauseOnLoudRaw = o.ttsPauseOnLoud
@@ -513,9 +516,9 @@ export default Plugin.define({
     const ttsPauseMsRaw = Number(o.ttsPauseMs)
     const ttsPauseMs = Number.isFinite(ttsPauseMsRaw) && ttsPauseMsRaw >= 200 ? ttsPauseMsRaw : 2000
     const ttsPausePeakRaw = Number(o.ttsPausePeak)
-    const ttsPausePeak = Number.isFinite(ttsPausePeakRaw) && ttsPausePeakRaw > 0 ? ttsPausePeakRaw : 20000
+    const ttsPausePeak = Number.isFinite(ttsPausePeakRaw) && ttsPausePeakRaw > 0 ? ttsPausePeakRaw : 12000
     const ttsPauseTicksRaw = Number(o.ttsPauseTicks)
-    const ttsPauseTicks = Number.isFinite(ttsPauseTicksRaw) && ttsPauseTicksRaw >= 1 ? ttsPauseTicksRaw : 3
+    const ttsPauseTicks = Number.isFinite(ttsPauseTicksRaw) && ttsPauseTicksRaw >= 1 ? ttsPauseTicksRaw : 2
     // Calibration needs a much longer settle than normal synthesis. The marker is
     // only ~200ms of audio but piper emits it in more than one burst, so the
     // normal 120ms quiet fires part-way through and measures a TRUNCATED marker
@@ -2308,6 +2311,16 @@ $audio.PlaySync()
                   log("speak: озвучка фрагмента завершена, но есть ещё текст — микрофон не открываю")
                   return
                 }
+                // The reply is STILL GENERATING. speechPending only counts what
+                // has been queued so far, and it hits 0 in the gap between two
+                // model chunks — measured, this opened the mic 3 times in 10
+                // during a single long answer ("it turns listening on by
+                // itself"). ansFinal is set by execution.succeeded, i.e. only
+                // once the whole reply is known, so it is the correct guard.
+                if (!ansFinal) {
+                  log("speak: ответ ещё не дописан — микрофон не открываю")
+                  return
+                }
                 // A step announcement or an ack: work is still coming.
                 if (stepSpeaking || ackBusy || !answerSpeaking) {
                   log("speak: промежуточная фраза (шаг/подтверждение) — микрофон не открываю")
@@ -2522,6 +2535,14 @@ $audio.PlaySync()
     const streamOffsets = new Map() // assistantMessageID -> raw char index already spoken
     const streamAccum = new Map()   // assistantMessageID -> accumulated text from session.text.delta
     let speakingMsgID = null        // message being voiced — a change means a new turn's reply arrived
+    // Second guard against re-voicing a finished/interrupted reply. When a new
+    // turn starts, the newest assistant message at that instant is still the
+    // PREVIOUS reply — the new one does not exist yet, so a poller that simply
+    // takes "the last assistant message" would read the old answer and narrate
+    // it again. floorMsgID is that message; until a different one shows up the
+    // poller skips.
+    let floorMsgID = null
+    let awaitingNewMsg = false
     let ansQueue = []
     let ansBusy = false
     // Fragments still to be spoken. The post-listen window must not open while
@@ -2595,7 +2616,12 @@ $audio.PlaySync()
       speechPending = 0
       ansFinal = false
       answerSpeaking = false
-      streamOffsets.clear()
+      // NB: streamOffsets is deliberately NOT cleared. It is keyed by message id
+      // and records how much of each message has already been voiced — that is
+      // what stops a re-read. Clearing it made the poller pick up an
+      // interrupted reply from offset 0 and narrate the PREVIOUS answer in full
+      // right after a new message was sent. Entries for old messages are inert;
+      // ids are never reused.
       streamAccum.clear()
       // The mic is about to capture the interrupter's real voice — open the
       // echo gate immediately instead of waiting out the cooldown.
@@ -2645,6 +2671,16 @@ $audio.PlaySync()
       lastAckAt = now
       stopStaleAnswer()      // drop the previous turn's audio + queued backlog
       speakingMsgID = null   // next message claims cleanly — won't treat this ack as stale
+      // Pin the message that is newest RIGHT NOW: it is the previous turn's
+      // reply. Anything equal to it is stale until a genuinely new id appears.
+      try {
+        const sid = currentSessionID()
+        const list = (sid && context.data.session.message.list(sid)) ?? []
+        const prev = [...list].reverse().find((x) => x.type === "assistant")
+        floorMsgID = prev ? prev.id : null
+        awaitingNewMsg = true
+        log(`ack: порог сообщений = ${floorMsgID ?? "нет"} — старый ответ больше не озвучим`)
+      } catch {}
       if (!ackPhrases.length || !state.tts || dead) return
       const ackPhrase = ackPhrases[Math.floor(Math.random() * ackPhrases.length)]
       ackBusy = true         // hold steps + answer until the acknowledgment finishes
@@ -2755,6 +2791,14 @@ $audio.PlaySync()
         const list = context.data.session.message.list(sessionID) ?? []
         const a = [...list].reverse().find((x) => x.type === "assistant")
         if (!a) return
+        // Still on the previous turn's message: the new one has not been created
+        // yet. Voicing this would replay the old answer.
+        if (awaitingNewMsg) {
+          if (!floorMsgID || a.id === floorMsgID) return
+          awaitingNewMsg = false
+          floorMsgID = null
+          log(`poll: новое сообщение ${a.id} — начинаю озвучку заново`)
+        }
         let msg = a
         try {
           const res = await context.client.session.message.get({ sessionID, messageID: a.id })
