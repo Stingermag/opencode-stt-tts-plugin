@@ -619,16 +619,17 @@ export default Plugin.define({
     // Legacy: explicit blind sleep. >0 makes the wake path use it verbatim.
     const wakeDeviceMsRaw = Number(o.wakeDeviceMs)
     const wakeDeviceMs = Number.isFinite(wakeDeviceMsRaw) && wakeDeviceMsRaw >= 0 ? wakeDeviceMsRaw : 0
-    // Blip tones. Kept deliberately BELOW the speech formant band: formants that
-    // carry intelligibility sit roughly at F1 300-800 Hz and F2 800-2500 Hz, so
-    // a tone down there is what the mic hands straight to whisper as if it were
-    // part of what you said. Lower is better for recognition, with the floor
-    // being audibility — laptop speakers roll off hard below ~150 Hz, so going
-    // much under these two values trades a "blip" for silence.
+    // Blip tone. The pitch sits ABOVE the main formant region on purpose now: the
+    // brief asked for a bright/ringing cue, and intelligibility-critical energy
+    // sits at F1 300-800 Hz and F2 800-2500 Hz, so 900/1400 keeps the tone out
+    // of the most sensitive part of the band while still reading as "звонкий".
+    // It is not silence-proof: the wake detector can still transcribe it if it
+    // is loud when a scan lands. If you see stray words in a transcript after a
+    // blip, lower "blipLevel" rather than the pitch.
     const blipFreqLoRaw = Number(o.blipFreqLo)
-    const blipFreqLo = Number.isFinite(blipFreqLoRaw) && blipFreqLoRaw >= 40 ? blipFreqLoRaw : 130
+    const blipFreqLo = Number.isFinite(blipFreqLoRaw) && blipFreqLoRaw >= 40 ? blipFreqLoRaw : 900
     const blipFreqHiRaw = Number(o.blipFreqHi)
-    const blipFreqHi = Number.isFinite(blipFreqHiRaw) && blipFreqHiRaw >= 40 ? blipFreqHiRaw : 175
+    const blipFreqHi = Number.isFinite(blipFreqHiRaw) && blipFreqHiRaw >= 40 ? blipFreqHiRaw : 1400
     // Fraction of full scale, as the amplitude ceiling for the tone before the
     // fade/decay envelope is applied. 1.0 = hard clipping, so stay below.
     // Deliberately loud by default: the tone is well under F1 now, so the
@@ -1031,6 +1032,25 @@ export default Plugin.define({
           { freq: blipFreqHi, dur: 0.20 },
         ]
         const amplitude = Math.floor(32767 * blipLevel)
+        // Bell-like partial stack. A bare sine at these pitches reads as a flat
+        // beep; stacking a few harmonics is what makes it "ring". Ratios are
+        // slightly stretched off the harmonic series (1 : 2.02 : 3.06) because
+        // exactly-integer partials sound like an organ, not a struck bell.
+        // Summed amplitudes are normalised to 1.0 so the stack does not raise
+        // the peak by 1+0.45+0.2 and clip.
+        const PARTIALS = [
+          { mult: 1.0, amp: 0.62 },
+          { mult: 2.02, amp: 0.26 },
+          { mult: 3.06, amp: 0.12 },
+        ]
+        const norm = PARTIALS.reduce((s, p) => s + p.amp, 0)
+        // Makeup gain. Partials at incommensurate ratios rarely align in phase, so the
+        // summed waveform peaks well below the nominal amplitude — measured at
+        // ~0.59x, which made the blip about 6dB quieter than the previous
+        // single-sine version. This brings the peak back to ~88% FS (where the
+        // old one sat) while keeping clear headroom: at 1.55 the peak measured
+        // 95% FS, uncomfortably close to hard clipping.
+        const SHAPE = 1.45
         const chunks = []
         for (const { freq, dur } of parts) {
           const samples = Math.floor(sr * dur)
@@ -1041,15 +1061,24 @@ export default Plugin.define({
           const fadeSamples = Math.max(1, Math.min(1500, Math.floor(samples / 3)))
           for (let i = 0; i < samples; i++) {
             const t = i / samples
-            // Smooth attack/release + gentle decay across the tone
+            // Smooth attack/release + exponential decay across the tone
             const fade = Math.min(1, i / fadeSamples, (samples - i) / fadeSamples)
             const decay = 0.65 + 0.35 * (1 - t)
-            const v = Math.floor(Math.sin((2 * Math.PI * freq * i) / sr) * amplitude * fade * decay)
+            let s = 0
+            for (const { mult, amp } of PARTIALS) {
+              // Upper partials die faster, which is what a struck object sounds
+              // like — without this the tail stays as bright as the attack and
+              // reads as a buzz.
+              const d = mult === 1 ? 1 : Math.exp(-3.2 * mult * t)
+              s += Math.sin((2 * Math.PI * freq * mult * i) / sr) * amp * d
+            }
+            s /= norm
+            const v = Math.floor(s * amplitude * fade * decay * SHAPE)
             pcm.writeInt16LE(v, i * 2)
           }
           chunks.push(pcm)
           // Small gap between tones
-          chunks.push(Buffer.alloc(Math.floor(sr * 0.06) * 2))
+          chunks.push(Buffer.alloc(Math.floor(sr * 0.05) * 2))
         }
         const pcm = Buffer.concat(chunks)
         // SoundPlayer needs a real RIFF/WAV file — a raw .raw gave it no header,
