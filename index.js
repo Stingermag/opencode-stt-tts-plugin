@@ -415,6 +415,47 @@ export default Plugin.define({
       ? standbyWordsRaw.split(",").map((w) => w.trim().toLowerCase()).filter(Boolean)
       : wakeWords
     ).filter((w) => w.length >= 5)
+    // Whisper transcribes loosely and the wake words are exactly where it drifts:
+    // "мужик" comes back as "мужчик", "хватит" as "хватите"/"хватят". The MUTE
+    // words already got stem matching; the wake words did not, so a perfectly
+    // deliberate call was silently ignored whenever whisper added a suffix.
+    // Stems are matched WHOLE-WORD with a Unicode-aware boundary, so "муж" does
+    // not fire on "мужчина".
+    const wakeStems = wakeWords
+      .map((w) => w.replace(/(ик|ика|ике|ики|ам|ами|ах|ах|и|ите|ок|ла|ло|ли|ет|ют|ит|ил|у|ю|а|ой)$/u, ""))
+      .filter((w) => w.length >= 3 && !wakeWords.includes(w))
+
+    // Two kinds of alternative, and they need DIFFERENT matching:
+    //  - the full word must match whole-word, so "мужик" does not fire on
+    //    "мужинка". A Cyrillic-aware boundary is required: JS \b is ASCII-only
+    //    and never matches at a Cyrillic letter, which silently kills the rule.
+    //  - a stem must be allowed to take an inflectional ending ("муж" -> "мужчик",
+    //    "хват" -> "хватите"/"хватят"), so it is matched as a PREFIX limited to a
+    //    short tail. The cap is what keeps it safe: after "муж" a real word
+    //    continues with 4+ letters ("мужчина", "мужской"), which 0..3 rejects.
+    const buildWakeRe = (words) => {
+      const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      const stems = words
+        .map((w) => w.replace(/(ик|ика|ике|ики|ам|ами|ах|ах|и|ите|ок|ла|ло|ли|ет|ют|ит|ил|у|ю|а|ой)$/u, ""))
+        .filter((w) => w.length >= 3 && !words.includes(w))
+      const whole = words.map((w) => `(?:^|[^\\p{L}\\p{N}])${esc(w)}(?![\\p{L}\\p{N}])`)
+      const pref = stems.map((w) => `(?:^|[^\\p{L}\\p{N}])${esc(w)}\\p{L}{0,3}(?![\\p{L}\\p{N}])`)
+      if (!whole.length && !pref.length) return null
+      return new RegExp(`(?:${whole.concat(pref).join("|")})`, "iu")
+    }
+    const wakeReAll = buildWakeRe(wakeWords)
+    const wakeReStandby = buildWakeRe(standbyWords)
+    const findWakeWord = (t, re) => {
+      if (!re) return null
+      const m = t.match(re)
+      return m ? (m[0].trim() || t.trim()) : null
+    }
+    // Count of words, used to decide whether a mid-sentence wake word is a real
+    // deliberate call or just noise whisper shaped into one.
+    const wordCount = (t) => {
+      const s = t.replace(/[.,!?…;:"'`\[\]()—–-]/g, " ").trim()
+      return s ? s.split(/\s+/).length : 0
+    }
     // Say a wake word together with one of these and the bot stops talking AND
     // stops listening. Comma-separated; empty string disables the feature.
     // Checked only AFTER a wake word matched, so "заткнись" alone does nothing
@@ -888,12 +929,29 @@ export default Plugin.define({
         // started listening again" symptom. Short words still work while
         // recording; they are just not allowed to wake the bot from standby.
         const activeWakeWords = standby ? standbyWords : wakeWords
-        const hitEarly = standby
-          // From standby the keyword must LEAD the utterance — people address a
-          // wake word first ("мужик, сделай…"). A keyword landing mid-sentence
-          // is noise that whisper turned into a word, not a deliberate call.
-          ? activeWakeWords.find((w) => new RegExp(`^\\s*(?:(?:ну|эй|эх|хм|алло|слушай)\\s*,?\\s*)?${w}`).test(text))
-          : activeWakeWords.find((w) => text.includes(w))
+        // Standby uses its OWN word set: the short ones ("стоп", "тихо") are
+        // deliberately filtered out of standbyWords so noise cannot wake the bot.
+        const found = findWakeWord(text, standby ? wakeReStandby : wakeReAll)
+        let hitEarly = null
+        if (found) {
+          if (!standby) {
+            // Recording: any position counts.
+            hitEarly = found
+          } else {
+            // From standby the keyword must normally LEAD the utterance — people
+            // address a wake word first ("мужик, сделай…"). Measured over 4504
+            // standby scans: 86 genuine detections led the utterance but another
+            // 20 carried the word mid-sentence, and the old "^" anchor threw all
+            // 20 away. Those are recovered below with a length cap, which is
+            // what separates "мужик ну сделай" from a word hallucinated inside a
+            // long noise sentence.
+            const leads = activeWakeWords.some((w) => {
+              const safe = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+              return new RegExp(`^\\s*(?:(?:ну|эй|эх|хм|алло|слушай)\\s*,?\\s*)?${safe}`, "iu").test(text)
+            })
+            hitEarly = leads || wordCount(text) <= 4 ? found : null
+          }
+        }
         if (!hitEarly && isEchoOfSelf(text)) {
           log(`wake: echo of own speech, ignored`)
           return
