@@ -490,6 +490,20 @@ export default Plugin.define({
     // error; otherwise you are trading a rare failure for latency you barely feel.
     const wakeDeviceMsRaw = Number(o.wakeDeviceMs)
     const wakeDeviceMs = Number.isFinite(wakeDeviceMsRaw) && wakeDeviceMsRaw >= 0 ? wakeDeviceMsRaw : 400
+    // Blip tones. Kept deliberately BELOW the speech formant band: formants that
+    // carry intelligibility sit roughly at F1 300-800 Hz and F2 800-2500 Hz, so
+    // a tone down there is what the mic hands straight to whisper as if it were
+    // part of what you said. Lower is better for recognition, with the floor
+    // being audibility — laptop speakers roll off hard below ~150 Hz, so going
+    // much under these two values trades a "blip" for silence.
+    const blipFreqLoRaw = Number(o.blipFreqLo)
+    const blipFreqLo = Number.isFinite(blipFreqLoRaw) && blipFreqLoRaw >= 40 ? blipFreqLoRaw : 130
+    const blipFreqHiRaw = Number(o.blipFreqHi)
+    const blipFreqHi = Number.isFinite(blipFreqHiRaw) && blipFreqHiRaw >= 40 ? blipFreqHiRaw : 175
+    // Fraction of full scale. 1.0 = clipping; the old 32000 (0.98) was loud
+    // enough to leak into the open microphone and colour the next transcript.
+    const blipLevelRaw = Number(o.blipLevel)
+    const blipLevel = Number.isFinite(blipLevelRaw) && blipLevelRaw > 0 && blipLevelRaw <= 1 ? blipLevelRaw : 0.25
     let lastVoiceAt = Date.now()
     // When the capture segment started and when playback last ended. Anything
     // recorded BETWEEN those two was the assistant's own voice coming back
@@ -841,32 +855,37 @@ export default Plugin.define({
     function playBlip(kind = "on") {
       try {
         const sr = 44100
-        // Soft chime: lower pitches, moderate level, long fades and an
-        // exponential decay envelope — no clipping (the earlier 32600 +
-        // gain 10dB drove the DAC into hard clipping, hence the screech).
-        // Rising pair = listening ON, falling pair = listening OFF, so the
-        // user can tell the two apart without looking at the screen.
+        // Soft low thud instead of a chime. Pitch sits under F1 so the open mic
+        // barely picks it up, level is a fraction of full scale so it cannot
+        // colour the transcript, and the pure sine has no harmonic structure to
+        // resemble a syllable. Rising pair = listening ON, falling pair =
+        // listening OFF, so the two are distinguishable without looking.
         const parts = kind === "off"
-          ? [{ freq: 700, dur: 0.16 }, { freq: 440, dur: 0.30 }]
+          ? [{ freq: blipFreqHi, dur: 0.12 }, { freq: blipFreqLo, dur: 0.22 }]
           : [
-          { freq: 520, dur: 0.18 },
-          { freq: 780, dur: 0.26 },
+          { freq: blipFreqLo, dur: 0.13 },
+          { freq: blipFreqHi, dur: 0.20 },
         ]
+        const amplitude = Math.floor(32767 * blipLevel)
         const chunks = []
         for (const { freq, dur } of parts) {
           const samples = Math.floor(sr * dur)
           const pcm = Buffer.alloc(samples * 2)
+          // Fade must scale with the tone: the old fixed 4000-sample ramp was
+          // ~90ms, which on a shorter tone ate most of its body and left a
+          // click rather than a thud.
+          const fadeSamples = Math.max(1, Math.min(1500, Math.floor(samples / 3)))
           for (let i = 0; i < samples; i++) {
             const t = i / samples
             // Smooth attack/release + gentle decay across the tone
-            const fade = Math.min(1, i / 4000, (samples - i) / 4000)
+            const fade = Math.min(1, i / fadeSamples, (samples - i) / fadeSamples)
             const decay = 0.65 + 0.35 * (1 - t)
-            const v = Math.floor(Math.sin((2 * Math.PI * freq * i) / sr) * 32000 * fade * decay)
+            const v = Math.floor(Math.sin((2 * Math.PI * freq * i) / sr) * amplitude * fade * decay)
             pcm.writeInt16LE(v, i * 2)
           }
           chunks.push(pcm)
           // Small gap between tones
-          chunks.push(Buffer.alloc(Math.floor(sr * 0.07) * 2))
+          chunks.push(Buffer.alloc(Math.floor(sr * 0.06) * 2))
         }
         const pcm = Buffer.concat(chunks)
         // SoundPlayer needs a real RIFF/WAV file — a raw .raw gave it no header,
