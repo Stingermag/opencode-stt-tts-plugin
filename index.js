@@ -463,6 +463,36 @@ export default Plugin.define({
     let rawFile = null
     let playback = null
     let lastSpoken = null
+    // ---- Persistent Piper -------------------------------------------------
+    // Every speak() used to spawn piper, which loads the voice model before it
+    // makes any sound: measured 300ms before the first sample, independent of
+    // utterance length, and paid again for every spoken fragment. Piper does
+    // read newline-separated utterances from stdin and keeps running, so one
+    // long-lived process can amortise that to once per session.
+    //
+    // The hard part is boundaries: a pipe carries bytes, not records, so there
+    // is nothing telling us where one utterance stops and the next starts. We
+    // solve it with a marker line that is NEVER played — after each text we
+    // write a marker, so the marker is always the final bytes of the reply, and
+    // we strip it. Its length is calibrated at runtime rather than hardcoded
+    // (it measured 8820 bytes for the ru voice, but that is a property of the
+    // build, not a contract).
+    //
+    // piperBroken is a one-way latch: any failure at all disables this path for
+    // the rest of the session and speak() reverts to one process per utterance.
+    // Voice that is slower is strictly better than no voice.
+    let piperProc = null
+    let piperBroken = false
+    let piperMarkerBytes = 0      // calibrated on first use
+    let piperCalibrating = null   // in-flight calibration promise
+    let piperInFlight = false     // one utterance at a time; requests are queued
+    let piperWaiters = []
+    let piperBuf = []             // stdout chunks for the current utterance
+    let piperBufLen = 0
+    let piperLastDataAt = 0
+    let piperQuietTimer = null
+    let currentPiperAbandon = null
+    const PIPER_MARKER = "."
     // Echo gate: ttsActive is true from the moment speak() starts until playback
     // fully ends; ttsEndAt adds a short cooldown after so the tail of the last
     // word (still ringing in the room) can't be heard as fresh speech. While
@@ -527,6 +557,20 @@ export default Plugin.define({
     // which halves the average detection delay for a finished sentence.
     const streamPollRaw = Number(o.streamPollMs)
     const streamPollMs = Number.isFinite(streamPollRaw) && streamPollRaw >= 100 ? streamPollRaw : 250
+    // Persistent piper. Saves ~300ms of model load per spoken fragment, but it
+    // replaces the synthesis path, so it is opt-in: set "ttsPersistentPiper":
+    // true to try it. Any runtime failure latches it off for the session and
+    // falls back to one process per utterance.
+    const ttsPersistentPiper = o.ttsPersistentPiper === true
+    // Quiet gap that marks the end of an utterance in the persistent stream.
+    // Measured on the ru voice: piper emits every chunk of an utterance in one
+    // burst, so intra-utterance gaps were 0ms and the text->marker seam was
+    // 0-4ms. 120ms therefore has ~30x margin over the real maximum, while the
+    // obvious 300ms would have eaten the entire ~300ms model-load saving this
+    // path exists to avoid. Do not raise it casually: a value at or below the
+    // largest intra-utterance gap truncates mid-sentence.
+    const piperQuietRaw = Number(o.ttsPiperQuietMs)
+    const piperQuietMs = Number.isFinite(piperQuietRaw) && piperQuietRaw >= 60 ? piperQuietRaw : 120
     // Grace period after killing the detector's own sox before re-opening the mic.
     // Split from the process-exit wait: the old code slept a fixed 400ms because
     // killing the process does NOT release the device. Waiting for the actual
@@ -666,6 +710,7 @@ export default Plugin.define({
 
     // stopPlayback() opens a new post-listen window; entering standby must not.
     function stopPlaybackSilently() {
+      abandonPiperUtterance()
       if (!playback) return
       try { playback.piper.kill() } catch {}
       try { playback.sox.kill() } catch {}
@@ -675,6 +720,7 @@ export default Plugin.define({
     }
 
     function stopPlayback() {
+      abandonPiperUtterance()
       if (!playback) return
       try { playback.piper.kill() } catch {}
       try { playback.sox.kill() } catch {}
@@ -1899,6 +1945,172 @@ $audio.PlaySync()
       await finishSegment({ file: rf })
     }
 
+    // ---- Persistent piper helpers --------------------------------------------
+    // One-way kill switch. Every failure path funnels through here so the
+    // fallback is a single decision made in one place.
+    function disablePersistentPiper(reason) {
+      if (piperBroken) return
+      piperBroken = true
+      log(`tts: постоянный piper ОТКЛЮЧЁН — ${reason}; далее отдельный процесс на фразу`)
+      killPersistentPiper()
+      // Release anyone waiting; they retry on the fallback path.
+      const waiters = piperWaiters
+      piperWaiters = []
+      piperInFlight = false
+      for (const w of waiters) w.reject(new Error(reason))
+    }
+
+    function killPersistentPiper() {
+      if (piperQuietTimer) { clearTimeout(piperQuietTimer); piperQuietTimer = null }
+      piperBuf = []
+      piperBufLen = 0
+      piperCalibrating = null
+      const p = piperProc
+      piperProc = null
+      if (p) { try { p.kill() } catch {} }
+    }
+
+    function ensurePersistentPiper() {
+      if (!ttsPersistentPiper || piperBroken) return null
+      if (piperProc && !piperProc.killed && piperProc.exitCode === null) return piperProc
+      piperBuf = []
+      piperBufLen = 0
+      let proc
+      try {
+        proc = spawn(piperBin, [
+          "-m", voiceOnnx,
+          "--output_raw",
+          "--length_scale", String(ttsLengthScale),
+          "--sentence_silence", String(ttsSentenceSilence),
+        ], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
+      } catch (e) {
+        disablePersistentPiper(`spawn: ${e?.message}`)
+        return null
+      }
+      piperProc = proc
+      proc.stdout.on("data", (d) => {
+        piperBuf.push(d)
+        piperBufLen += d.length
+        piperLastDataAt = Date.now()
+        if (piperQuietTimer) { clearTimeout(piperQuietTimer); piperQuietTimer = null }
+        if (piperInFlight) schedulePiperBoundary()
+      })
+      let procErr = ""
+      proc.stderr.on("data", (d) => { procErr += d.toString() })
+      proc.on("error", (e) => disablePersistentPiper(`error: ${e?.message}`))
+      proc.on("close", (code) => {
+        if (piperProc !== proc) return
+        piperProc = null
+        const wasIdle = !piperInFlight
+        // An unexpected exit with work outstanding is fatal for this path; an
+        // idle exit (plugin cleanup) is just the end of the session.
+        if (!wasIdle) disablePersistentPiper(`unexpected close code=${code}${procErr ? ` err=${procErr.slice(-120)}` : ""}`)
+      })
+      log(`tts: постоянный piper pid=${proc.pid} готов`)
+      return proc
+    }
+
+    function schedulePiperBoundary() {
+      if (piperQuietTimer) return
+      piperQuietTimer = setTimeout(() => {
+        piperQuietTimer = null
+        // Not enough data to contain a whole marker yet — wait rather than cut.
+        if (piperMarkerBytes && piperBufLen < piperMarkerBytes) {
+          schedulePiperBoundary()
+          return
+        }
+        finishPiperUtterance()
+      }, piperQuietMs)
+    }
+
+    function finishPiperUtterance() {
+      const waiter = piperWaiters.shift()
+      const buf = piperBufLen ? Buffer.concat(piperBuf, piperBufLen) : Buffer.alloc(0)
+      piperBuf = []
+      piperBufLen = 0
+      piperInFlight = piperWaiters.length > 0
+      if (!waiter) return
+      // This utterance was interrupted after being sent to piper. Its audio is
+      // already in flight and cannot be recalled, so swallow it here instead of
+      // letting it land on the NEXT request.
+      if (waiter.drain) { waiter.resolve(null); return }
+      if (!piperMarkerBytes) {
+        // Calibration round: the bytes we just got ARE the marker.
+        piperMarkerBytes = buf.length
+        log(`tts: маркер откалиброван = ${piperMarkerBytes}B`)
+        waiter.resolve(Buffer.alloc(0))
+        return
+      }
+      if (buf.length <= piperMarkerBytes) {
+        // No audio beyond the marker — malformed or empty. Let the caller retry
+        // on the fallback rather than play silence.
+        waiter.reject(new Error("persistent piper produced no audio"))
+        return
+      }
+      // Marker is always the LAST bytes: we wrote text then marker.
+      waiter.resolve(buf.subarray(0, buf.length - piperMarkerBytes))
+    }
+
+    // Calibrate the marker length once per process, by asking piper to render
+    // the marker alone and measuring what comes back. Hardcoding 8820 would tie
+    // us to one build and one voice.
+    function calibratePersistentPiper(proc) {
+      if (piperMarkerBytes) return Promise.resolve(piperMarkerBytes)
+      if (piperCalibrating) return piperCalibrating
+      piperCalibrating = new Promise((resolve, reject) => {
+        piperWaiters.push({
+          resolve: (v) => { piperCalibrating = null; resolve(piperMarkerBytes || v.length) },
+          reject: (e) => { piperCalibrating = null; reject(e) },
+        })
+        piperInFlight = true
+        piperBuf = []
+        piperBufLen = 0
+        try {
+          proc.stdin.write(`${PIPER_MARKER}\n`)
+        } catch (e) {
+          disablePersistentPiper(`calibrate write: ${e?.message}`)
+          reject(e)
+        }
+      })
+      return piperCalibrating
+    }
+
+    // Synthesise one utterance on the shared process. Resolves raw PCM, or
+    // rejects so the caller can fall back.
+    function synthesizePersistent(text) {
+      const proc = ensurePersistentPiper()
+      if (!proc) return Promise.reject(new Error("persistent piper unavailable"))
+      return calibratePersistentPiper(proc).then(() => {
+        if (piperBroken || !piperProc) throw new Error("persistent piper died during calibration")
+        return new Promise((resolve, reject) => {
+          const waiter = { resolve, reject, drain: false }
+          piperWaiters.push(waiter)
+          piperInFlight = true
+          piperBuf = []
+          piperBufLen = 0
+          // If this request is abandoned (wake word, mute, new message) the
+          // audio is already rendering, so flag it to be discarded on arrival.
+          currentPiperAbandon = () => { waiter.drain = true }
+          try {
+            // text first, marker LAST, so the marker is the trailing bytes
+            proc.stdin.write(`${text}\n${PIPER_MARKER}\n`)
+          } catch (e) {
+            disablePersistentPiper(`write: ${e?.message}`)
+            reject(e)
+          }
+        })
+      })
+    }
+
+    // Called when playback is cut while synthesis is still in flight, so the
+    // abandoned audio is dropped instead of landing on the next speaker.
+    function abandonPiperUtterance() {
+      if (currentPiperAbandon) {
+        currentPiperAbandon()
+        currentPiperAbandon = null
+      }
+    }
+
     async function speak(text, { direct = false, isLast = false } = {}) {
       if (!text.trim()) return
       log(`speak: requested (${text.length} chars)`)
@@ -2004,30 +2216,60 @@ $audio.PlaySync()
 
         // Phase 1: generate ALL audio with piper into memory. No pipe to sox,
         // so there is no EOF race that drops the tail of the phrase.
-        const piper = spawn(piperBin, [
-          "-m", voiceOnnx,
-          "--output_raw",
-          "--length_scale", String(ttsLengthScale),
-          "--sentence_silence", String(ttsSentenceSilence),
-        ], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
-        mine.piper = piper
-        log(`speak: piper pid=${piper.pid} (buffering), length_scale=${ttsLengthScale}, ${stripped.length} chars`)
-        const chunks = []
-        let piperErr = ""
-        piper.stdout.on("data", (d) => chunks.push(d))
-        piper.stderr.on("data", (d) => { piperErr += d.toString() })
-        piper.on("error", (e) => {
-          toast(`Piper не запустился: ${e.message}`, "error")
-          if (active()) playback = null
-          done()
-        })
-        piper.on("close", (code) => {
-          log(`speak: piper closed code=${code}, buffered=${chunks.reduce((n, c) => n + c.length, 0)}B${piperErr ? ` err=${piperErr.slice(-200)}` : ""}`)
-          if (!active()) { done(); return } // interrupted during generation
-          playBuffer(Buffer.concat(chunks))
-        })
-        piper.stdin.write(`${stripped}\n`)
-        piper.stdin.end()
+        //
+        // Preferred path: the shared long-lived piper, which has already loaded
+        // the voice model. Every failure here falls through to a dedicated
+        // process below, so this can only cost latency, never voice.
+        const speakDedicated = () => {
+          const piper = spawn(piperBin, [
+            "-m", voiceOnnx,
+            "--output_raw",
+            "--length_scale", String(ttsLengthScale),
+            "--sentence_silence", String(ttsSentenceSilence),
+          ], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
+          mine.piper = piper
+          log(`speak: piper pid=${piper.pid} (buffering), length_scale=${ttsLengthScale}, ${stripped.length} chars`)
+          const chunks = []
+          let piperErr = ""
+          piper.stdout.on("data", (d) => chunks.push(d))
+          piper.stderr.on("data", (d) => { piperErr += d.toString() })
+          piper.on("error", (e) => {
+            toast(`Piper не запустился: ${e.message}`, "error")
+            if (active()) playback = null
+            done()
+          })
+          piper.on("close", (code) => {
+            log(`speak: piper closed code=${code}, buffered=${chunks.reduce((n, c) => n + c.length, 0)}B${piperErr ? ` err=${piperErr.slice(-200)}` : ""}`)
+            if (!active()) { done(); return } // interrupted during generation
+            playBuffer(Buffer.concat(chunks))
+          })
+          piper.stdin.write(`${stripped}\n`)
+          piper.stdin.end()
+        }
+
+        if (!ttsPersistentPiper || piperBroken) {
+          speakDedicated()
+          return
+        }
+        const tGen = Date.now()
+        synthesizePersistent(stripped)
+          .then((pcm) => {
+            currentPiperAbandon = null
+            // null = the utterance was abandoned mid-flight; its audio was
+            // dropped on purpose, so play nothing. done() already ran when it
+            // was interrupted.
+            if (pcm === null) return
+            if (!active()) { done(); return } // interrupted while synthesising
+            log(`tts: постоянный piper дал ${pcm.length}B за ${Date.now() - tGen}мс`)
+            playBuffer(pcm)
+          })
+          .catch((e) => {
+            // Interrupted, or persistent path failed — fall back. piperBroken may
+            // already be latched, in which case every later speak() goes direct.
+            if (!active()) { done(); return }
+            log(`tts: постоянный piper не сработал (${e?.message}) — отдельный процесс`)
+            speakDedicated()
+          })
 
         // Phase 2: play the complete buffer from a temp file — sox reads a
         // finished file, so it can't exit early on a transient pipe EOF.
@@ -2840,6 +3082,9 @@ $audio.PlaySync()
       // after this function returns; with dead=true the old handlers become
       // no-ops instead of resurrecting the generation (see `dead` above).
       dead = true
+      // The shared piper outlives individual speak() calls on purpose, so it
+      // MUST be reaped here or it survives as an orphan holding the voice model.
+      killPersistentPiper()
       offIdle()
       try { offPart() } catch {}
       try { offExecFail() } catch {}
