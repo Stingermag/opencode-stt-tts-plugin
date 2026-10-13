@@ -1217,11 +1217,16 @@ $audio.PlaySync()
     let preArmed = false
     // Whether the clip currently playing is the last one of this reply.
     let isLastFragmentActive = false
-    // Seconds of playback left when the listen window is opened. Opening it a
-    // beat early means the mic is already live for the moment the voice ends,
-    // so the first word isn't lost to the 500ms VAD cadence.
+    // Seconds of playback left when the listen window is opened, so the mic is
+    // already live the instant the voice stops and the first word isn't lost to
+    // the VAD cadence. Keep it to roughly one word (~600ms): the old 2s opened
+    // the mic, seeded "speech seen" and played the listening blip while the
+    // narrator was still talking, which is why dictation started picking up the
+    // tail of the answer. Lower bound is the 500ms VAD tick — pre-roll is only
+    // evaluated there, so anything under that can't reliably fire before the
+    // end and silently degrades to the post-playback path.
     const preRollRaw = Number(o.preRoll)
-    const preRollMs = Number.isFinite(preRollRaw) && preRollRaw >= 0 ? preRollRaw * 1000 : 2000
+    const preRollMs = Number.isFinite(preRollRaw) && preRollRaw >= 0 ? preRollRaw * 1000 : 600
     // Guards the echo-confirmation pass so overlapping ticks can't queue up
     // several whisper runs against the same playback window.
     let bargeVerifyBusy = false
