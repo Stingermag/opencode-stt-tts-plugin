@@ -293,7 +293,9 @@ export default Plugin.define({
     // buys resolution we can't use and starts cutting phrases mid-thought at
     // natural clause boundaries.
     const hfSilenceRaw = Number(o.handsFreeSilence)
-    const hfSilence = Number.isFinite(hfSilenceRaw) && hfSilenceRaw >= 1 ? hfSilenceRaw : 1.0
+    // Floor lowered from 1.0 to 0.4 together with the VAD tick (500 -> 250ms), so
+    // short pauses can end the phrase. Below ~0.7 expect cut-off mid-sentence.
+    const hfSilence = Number.isFinite(hfSilenceRaw) && hfSilenceRaw >= 0.4 ? hfSilenceRaw : 1.0
     // Amplitude thresholds for sox silence detection (leading onset / trailing
     // stop). A higher hands-free threshold keeps room noise from triggering
     // phantom segments that whisper would transcribe into hallucinations.
@@ -333,6 +335,11 @@ export default Plugin.define({
     // buffer forces sox to keep the device open and drain it; the unavoidable
     // cutoff then lands in the silence, after the speech.
     const TTS_TAIL_SEC = 1.0
+    // How long before the end of the audible speech the next clip is let into
+    // synthesis. Roughly one piper render (0.2-0.4s measured).
+    const TTS_RELEASE_LEAD_MS = 350
+    // Delay between spawning sox and the first audible sample.
+    const SOX_STARTUP_MS = 300
     // Echo tail after the speaker stops: the last words still ring in the room
     // and the mic would hear them as fresh speech. Ignore the mic for this long
     // after playback ends so the echo can't close a phantom segment.
@@ -552,6 +559,48 @@ export default Plugin.define({
     // work. With headphones the false-positive risk disappears entirely.
     let pauseHook = null          // set by the active speak() to pause its clip
     let pauseTicks = 0            // consecutive loud VAD ticks before pausing
+    // Ducking: when the user talks over the bot, the voice drops to duckGain
+    // instead of stopping. The wake word is the hard stop. duckHook restarts the
+    // playing clip from its current position at the new volume (sox has no live
+    // volume control); a timer brings the volume back once the user goes quiet.
+    const duckOnInterrupt = o.duckOnInterrupt !== false
+    const duckGainRaw = Number(o.duckGain)
+    const duckGain = Number.isFinite(duckGainRaw) && duckGainRaw > 0 && duckGainRaw <= 1 ? duckGainRaw : 0.2
+    const duckHoldRaw = Number(o.duckHoldMs)
+    const duckHoldMs = Number.isFinite(duckHoldRaw) && duckHoldRaw >= 500 ? duckHoldRaw : 3500
+    let ducked = false
+    let duckTimer = null
+    let duckHook = null
+    // Bumped on every stop/cancel. A speak() queued before the bump is dropped
+    // instead of playing stale audio after the interruption.
+    let speechGen = 0
+    // When the speech of the clip now playing stops being audible (its silent
+    // tail excluded); the next clip must not start before this.
+    let audibleEndsAt = 0
+    // Every sox still running. A clip released early may still be audible when
+    // the next one owns `playback`, so a stop has to kill them all.
+    const liveSox = new Set()
+    function killLiveSox() {
+      for (const s of liveSox) { try { s.kill() } catch {} }
+      liveSox.clear()
+    }
+
+    function resetDuck() {
+      ducked = false
+      if (duckTimer) { clearTimeout(duckTimer); duckTimer = null }
+    }
+
+    function setDuck(on) {
+      if (on) {
+        if (duckTimer) clearTimeout(duckTimer)
+        duckTimer = setTimeout(() => { duckTimer = null; setDuck(false) }, duckHoldMs)
+      }
+      if (ducked === on) return
+      ducked = on
+      if (!on && duckTimer) { clearTimeout(duckTimer); duckTimer = null }
+      log(`duck: ${on ? `пользователь говорит — приглушаю до ${duckGain}` : "тихо — возвращаю громкость"}`)
+      try { if (duckHook) duckHook() } catch (e) { log(`duck: hook error ${e?.message || e}`) }
+    }
     const ttsPauseOnLoudRaw = o.ttsPauseOnLoud
     const ttsPauseOnLoud = ttsPauseOnLoudRaw !== false
     const ttsPauseMsRaw = Number(o.ttsPauseMs)
@@ -786,6 +835,11 @@ export default Plugin.define({
 
     // stopPlayback() opens a new post-listen window; entering standby must not.
     function stopPlaybackSilently() {
+      speechGen++
+      audibleEndsAt = 0
+      killLiveSox()
+      resetDuck()
+      duckHook = null
       abandonPiperUtterance()
       pauseHook = null
       pauseTicks = 0
@@ -798,6 +852,11 @@ export default Plugin.define({
     }
 
     function stopPlayback() {
+      speechGen++
+      audibleEndsAt = 0
+      killLiveSox()
+      resetDuck()
+      duckHook = null
       abandonPiperUtterance()
       // A pending resume would restart sox after the clip was already killed.
       pauseHook = null
@@ -1289,6 +1348,36 @@ $audio.PlaySync()
       return false
     }
 
+    // Echo check for a FINISHED segment that is about to be sent to the chat.
+    // isEchoOfSelf() above is tuned for short wake windows recorded mid-playback;
+    // on a whole sentence it threw away real questions ("Чё ты слышишь меня?"
+    // was dropped because the bot had said "слышишь"/"меня"/"ты" a moment ago).
+    // Here only content words count (4+ letters, no everyday fillers), the heard
+    // text must be almost entirely ours (80%), and only the last 25s are
+    // considered. The playback itself was already cut from the segment.
+    const ECHO_STOP_WORDS = new Set([
+      "что", "это", "как", "так", "тебя", "меня", "мне", "тебе", "там", "тут", "вот", "ещё", "еще",
+      "есть", "если", "когда", "чтобы", "почему", "потому", "очень", "просто", "можно", "нужно",
+      "слышишь", "слышу", "давай", "ладно", "хорошо", "понял", "понятно", "ничего", "всё", "все",
+    ])
+    function isEchoOfSelfStrict(heard) {
+      const h = normForEcho(heard)
+      if (!h) return false
+      const now = Date.now()
+      const hw = h.split(" ").filter((w) => w.length > 3 && !ECHO_STOP_WORDS.has(w))
+      for (let i = recentSpoken.length - 1; i >= 0; i--) {
+        const s = recentSpoken[i]
+        if (now - s.t > 25000) break
+        // A long phrase that appears verbatim in what we said is our own voice.
+        if (h.length >= 15 && s.text.includes(h)) return true
+        if (hw.length < 2) continue
+        const sw = new Set(s.text.split(" "))
+        const hit = hw.filter((w) => sw.has(w)).length
+        if (hit / hw.length >= 0.8) return true
+      }
+      return false
+    }
+
     // `fast: true` picks the small model. Background work — the wake-word scan and
     // the live preview — never needs the big model: they only look for one word
     // in a couple of seconds of audio. Measured on this machine, 3s of audio:
@@ -1512,6 +1601,12 @@ $audio.PlaySync()
     // consecutive loud ticks and ignore the first400ms of playback (the lead-in
     // attack echoes hardest) before we cut the voice off mid-word.
     let bargeLoudTicks = 0
+    // VAD cadence. It bounds how soon the end of a phrase is noticed (the check
+    // is `silent for >= hfSilence`, evaluated once per tick), so 250ms instead
+    // of 500ms cuts on average 125ms off every send. Tick-counted thresholds
+    // below are scaled to keep their duration (BARGE_LOUD_TICKS).
+    const VAD_TICK_MS = 250
+    const BARGE_LOUD_TICKS = 4 // was 2 ticks at 500ms
     let playingSince = 0
     // When the current clip finishes playing (epoch ms), 0 when nothing plays.
     let playEndsAt = 0
@@ -1613,7 +1708,7 @@ $audio.PlaySync()
           // Diagnostic: log VAD state every 10 seconds to understand why
           // segments may not be closing (e.g. speech never detected, or
           // playback gate stuck open).
-          if (++vadTick % 20 === 0) {
+          if (++vadTick % 40 === 0) {
             const playing = ttsActive || Date.now() < ttsEndAt
             log(`vad: state size=${st.size} peak=${peak} speech=${vadSpeechSeen} playing=${playing} silentFor=${((Date.now() - vadLastSpeechAt) / 1000).toFixed(1)}s hfSilence=${hfSilence}s`)
           }
@@ -1643,14 +1738,14 @@ $audio.PlaySync()
             pauseTicks = 0
           }
           let bargeIn = false
-          if (!bargeInEnabled && playing) {
+          if (!bargeInEnabled && !duckOnInterrupt && playing) {
             // Half-duplex: mic is deaf for the whole TTS window. Nothing can
             // mark "speech" here, so a segment can't close on the bot's own
             // voice. The wake-word path is independent (see scanWakeAudio) and
             // still reacts to «мужик» mid-sentence.
           } else if (playing && peak >= bargePeak && Date.now() - playingSince > 400) {
             bargeLoudTicks++
-            if (bargeLoudTicks >= 2) {
+            if (bargeLoudTicks >= BARGE_LOUD_TICKS) {
               bargeLoudTicks = 0
               // Amplitude can't separate the user from speaker echo — the mic
               // measures the bot's own voice just as high as close speech (peaks
@@ -1663,6 +1758,12 @@ $audio.PlaySync()
                 verifyBargeIn(candPlaying)
                   .then((isReal) => {
                     if (!isReal) return
+                    // Talking over the bot: make it quieter instead of silent.
+                    // Only the wake word stops it completely.
+                    if (duckOnInterrupt && !bargeInEnabled) {
+                      setDuck(true)
+                      return
+                    }
                     cancelAnswer() // clear ansQueue FIRST — stopPlayback() alone leaves
                     stopPlayback() // queued old text, which pumpSpeech() would resume
                     bargeIn = true // a real interrupter — capture what they said
@@ -1712,7 +1813,7 @@ $audio.PlaySync()
           }
           if (inPostListen) {
             // Silence inside the window: keep waiting until it expires.
-            if (++vadTick % 8 === 0) {
+            if (++vadTick % 16 === 0) {
               log(`hf: окно прослушивания, тишина (peak=${peak} < ${postListenPeak}), осталось ${((postListenUntil - now) / 1000).toFixed(1)}с`)
             }
             return
@@ -1721,6 +1822,13 @@ $audio.PlaySync()
           // instead of transcribing the room for the rest of the session.
           if (!postListenSpeech && postListenExpired) {
             postListenExpired = false
+            // enterStandby() calls cancelAnswer(): if the window of an earlier
+            // phrase (an ack, a step) runs out just as the reply starts, the bot
+            // cut off its own answer. Standby is only for a quiet room.
+            if (isReplying()) {
+              log("hf: окно прослушивания истекло, но идёт озвучка — в ожидание не ухожу")
+              return
+            }
             enterStandby("тишина после озвучки")
             return
           }
@@ -1729,7 +1837,7 @@ $audio.PlaySync()
           // empty room doesn't keep a capture process alive indefinitely.
           // hfManual arms are exempt — releasing the mic seconds after an
           // explicit hotkey press reads as "the toggle didn't take".
-          if (idleStop > 0 && !hfManual && !playing && !standby && now - lastVoiceAt >= idleStop * 1000) {
+          if (idleStop > 0 && !hfManual && !playing && !isReplying() && !standby && now - lastVoiceAt >= idleStop * 1000) {
             enterStandby(`нет речи ${idleStop}с`)
             return
           }
@@ -1758,7 +1866,7 @@ $audio.PlaySync()
         } catch (e) {
           log(`vad: ${e?.message || e}`)
         }
-      }, 500)
+      }, VAD_TICK_MS)
     }
 
     function stopVad() {
@@ -2072,7 +2180,7 @@ $audio.PlaySync()
         }
         // The whole segment is our own TTS bouncing back through the speakers
         // — not the user speaking. Don't submit it as a message.
-        if (auto && isEchoOfSelf(messageText)) {
+        if (auto && isEchoOfSelfStrict(messageText)) {
           log(`hf: эхо собственной озвучки отброшено: "${finalText.slice(0, 60)}"`)
           return
         }
@@ -2280,14 +2388,40 @@ $audio.PlaySync()
       }
     }
 
-    async function speak(text, { direct = false, isLast = false } = {}) {
+    // Every phrase (ack, step status, reply chunk) goes through one queue and
+    // plays only after the previous one has ended. speak() used to call
+    // stopPlayback() on entry, so a status phrase and the answer cut each other
+    // off and the bot interrupted itself. Only an explicit stop (wake word,
+    // standby, new turn) clears the queue, via speechGen.
+    let speakTail = Promise.resolve()
+    const SPEAK_QUEUE_STALL_MS = 25000
+
+    function speak(text, opts = {}) {
+      let gen = speechGen
+      const prev = speakTail
+      const run = new Promise((resolve) => {
+        const stall = setTimeout(() => resolve("stalled"), SPEAK_QUEUE_STALL_MS)
+        prev.then(() => { clearTimeout(stall); resolve("ready") }, () => { clearTimeout(stall); resolve("ready") })
+      }).then((state) => {
+        if (state === "stalled") {
+          log("speak: очередь озвучки зависла — продолжаю принудительно")
+          try { stopPlayback() } catch {}
+          gen = speechGen // our own forced stop must not drop this phrase
+        }
+        if (gen !== speechGen) return
+        return speakNow(text, opts)
+      })
+      speakTail = run.catch(() => {})
+      return run
+    }
+
+    async function speakNow(text, { direct = false, isLast = false } = {}) {
       if (!text.trim()) return
       log(`speak: requested (${text.length} chars)`)
       if (!fs.existsSync(voiceOnnx)) {
         toast("Голосовая модель Piper не найдена", "warning")
         return
       }
-      stopPlayback()
       // Нормализация отключена — используем текст как есть
       const spoken = text
       const stripped = spoken
@@ -2434,10 +2568,17 @@ $audio.PlaySync()
         synthesizePersistent(stripped)
           .then((pcm) => {
             currentPiperAbandon = null
-            // null = the utterance was abandoned mid-flight; its audio was
-            // dropped on purpose, so play nothing. done() already ran when it
-            // was interrupted.
-            if (pcm === null) return
+            // null = abandoned mid-flight (barge-in, standby, a newer speak()):
+            // its audio was dropped on purpose, so play nothing. Nothing else
+            // settles this promise, so it must be released here. Without that
+            // speak() never resolved and ansBusy/ackBusy stayed latched, which
+            // silenced every later reply until restart. The half-duplex gate
+            // is released only when nobody else owns playback.
+            if (pcm === null) {
+              if (playback === null) done()
+              else if (!settled) { settled = true; resolve() }
+              return
+            }
             if (!active()) { done(); return } // interrupted while synthesising
             log(`tts: постоянный piper дал ${pcm.length}B за ${Date.now() - tGen}мс`)
             playBuffer(pcm)
@@ -2477,6 +2618,7 @@ $audio.PlaySync()
           let playedOffset = 0
           let paused = false
           let resumeTimer = null
+          let tailTimer = null
 
           const startSoxFrom = (offsetSec) => {
             // sox argument order is [input opts] infile [output opts] outfile
@@ -2488,8 +2630,11 @@ $audio.PlaySync()
               "-t", "waveaudio", "-d",
             ]
             if (offsetSec > 0.05) args.push("trim", offsetSec.toFixed(3))
+            if (ducked) args.push("vol", String(duckGain))
             const sox = spawn(soxBin, args, { windowsHide: true })
             mine.sox = sox
+            liveSox.add(sox)
+            sox.on("close", () => liveSox.delete(sox))
             playingSince = Date.now()
             // Duration of what sox is about to play, so the mic can be armed a
             // moment before the last word instead of after it. Rebased from the
@@ -2497,6 +2642,25 @@ $audio.PlaySync()
             // a pause: without this the deadline stays where it was and the
             // listen window opens while the narrator is still mid-clip.
             playEndsAt = playingSince + Math.floor((totalSec - offsetSec) * 1000)
+            // The clip carries TTS_TAIL_SEC of silence that sox must play out so
+            // the last word is not cut. Mid-reply that silence is dead air before
+            // the next sentence, so the queue is released a moment before the
+            // speech itself ends and the next clip (already synthesised by then)
+            // starts exactly when this one stops being audible. The last clip
+            // keeps its tail: it doubles as the echo cool-down.
+            // + SOX_STARTUP_MS: sox needs a moment after spawn before the first
+            // sample reaches the speakers. Without it the next clip started that
+            // much too early and two phrases overlapped (seen on short clips
+            // like the ack, where the whole speech is shorter than the startup).
+            audibleEndsAt = playingSince + SOX_STARTUP_MS + Math.floor((totalSec - offsetSec - TTS_TAIL_SEC) * 1000)
+            if (tailTimer) { clearTimeout(tailTimer); tailTimer = null }
+            if (!isLastFragment) {
+              tailTimer = setTimeout(() => {
+                tailTimer = null
+                if (paused || dead || !active() || mine.sox !== sox) return
+                done()
+              }, Math.max(0, audibleEndsAt - TTS_RELEASE_LEAD_MS - Date.now()))
+            }
             preArmed = false
             isLastFragmentActive = isLastFragment
             bargeLoudTicks = 0
@@ -2505,17 +2669,20 @@ $audio.PlaySync()
               // A pause kills sox deliberately. That close is NOT the end of the
               // clip — falling through to cleanup()/done() here would delete the
               // temp file and end the reply mid-sentence.
-              if (paused) { log(`speak: sox-play closed (пауза) code=${code}`); return }
+              // `mine.sox !== sox`: this process was replaced by a restart (duck).
+              if (paused || mine.sox !== sox) { log(`speak: sox-play closed (пауза/перезапуск) code=${code}`); return }
               log(`speak: sox-play closed code=${code}`)
               if (pauseHook === pauseClip) pauseHook = null
+              if (duckHook === restartClip) duckHook = null
               if (active()) playback = null
               cleanup()
               done()
             })
             sox.on("error", (e) => {
-              if (paused) return
+              if (paused || mine.sox !== sox) return
               log(`speak: sox-play error ${e?.message || e}`)
               if (pauseHook === pauseClip) pauseHook = null
+              if (duckHook === restartClip) duckHook = null
               cleanup()
               done()
             })
@@ -2531,18 +2698,52 @@ $audio.PlaySync()
             if (playedOffset >= totalSec - 0.05) { paused = false; return } // already finished
             const proc = mine.sox
             mine.sox = null
+            if (tailTimer) { clearTimeout(tailTimer); tailTimer = null }
             try { proc.kill() } catch {}
             log(`tts: пауза на ${ttsPauseMs}мс, позиция ${playedOffset.toFixed(2)}/${totalSec.toFixed(2)}с`)
             resumeTimer = setTimeout(() => {
               resumeTimer = null
-              if (dead || !active()) { paused = false; pauseHook = null; return }
+              // Stopped while paused: no sox is running to report the end, so the
+              // promise must be settled here or speak() hangs.
+              if (dead || !active()) { paused = false; pauseHook = null; cleanup(); done(); return }
               paused = false
               startSoxFrom(playedOffset)
             }, ttsPauseMs)
           }
           if (ttsPauseOnLoud) pauseHook = pauseClip
 
-          startSoxFrom(0)
+          // Volume change mid-clip: restart sox from where it is, now with (or
+          // without) the `vol` effect. Same bookkeeping as pauseClip, but the
+          // clip resumes almost immediately instead of after ttsPauseMs.
+          function restartClip() {
+            if (paused || dead || !mine.sox) return
+            paused = true
+            playedOffset += (Date.now() - playingSince) / 1000
+            if (playedOffset >= totalSec - 0.05) { paused = false; return }
+            const proc = mine.sox
+            mine.sox = null
+            if (tailTimer) { clearTimeout(tailTimer); tailTimer = null }
+            try { proc.kill() } catch {}
+            resumeTimer = setTimeout(() => {
+              resumeTimer = null
+              if (dead || !active()) { paused = false; cleanup(); done(); return }
+              paused = false
+              startSoxFrom(playedOffset)
+            }, 30)
+          }
+          duckHook = restartClip
+
+          // The previous clip may still be audible (the queue is released
+          // TTS_RELEASE_LEAD_MS early): hold this one until it has finished.
+          const waitMs = audibleEndsAt - Date.now()
+          if (waitMs > 20) {
+            setTimeout(() => {
+              if (dead || !active()) { cleanup(); done(); return }
+              startSoxFrom(0)
+            }, waitMs)
+          } else {
+            startSoxFrom(0)
+          }
         }
       })
     }
@@ -2561,6 +2762,11 @@ $audio.PlaySync()
     // first sentence can start speaking with near-zero latency.
     function cleanForSpeech(md) {
       let s = String(md ?? "")
+      // Emoji are not read out. Laughing faces become a laugh; every other
+      // emoji (and the joiners/variation selectors that glue them) is dropped.
+      s = s.replace(/[\u{1F602}\u{1F923}\u{1F606}\u{1F639}]+/gu, " ха-ха-ха! ")
+      s = s.replace(/[\u{1F600}\u{1F603}\u{1F604}\u{1F601}\u{1F605}]+/gu, " хе-хе. ")
+      s = s.replace(/[\p{Extended_Pictographic}‍️\u{1F3FB}-\u{1F3FF}]+/gu, " ")
       s = s.replace(/```[\s\S]*?```/g, " ")          // drop code blocks (don't read code aloud)
       s = s.replace(/`([^`]*)`/g, "$1")               // inline code -> content
       s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")  // image -> alt
@@ -2588,6 +2794,29 @@ $audio.PlaySync()
       let m
       while ((m = re.exec(text))) end = m.index + m[0].length
       return end
+    }
+
+    // Only the spoken part of a reply is voiced: everything before the first code
+    // fence or a line of "---". The assistant is told to put details (code,
+    // commands, lists, paths) after that line, so they appear in the chat in
+    // full but are not read aloud.
+    function speechLimit(text) {
+      const m = /(^|\n)[ \t]*(```|-{3,}[ \t]*(\n|$))/.exec(text)
+      return m ? m.index : text.length
+    }
+
+    // Next point to speak up to: a finished sentence, the end of the spoken part
+    // once the marker has arrived, or — for the very first words of a reply —
+    // a clause boundary, so the voice starts before the first full stop exists.
+    function nextSpeakableEnd(text, off) {
+      const lim = speechLimit(text)
+      if (lim < text.length) return lim > off ? lim : -1
+      const end = speakableEnd(text, off)
+      if (end > off || off > 0) return end
+      const m = /[,;:—–]\s/g
+      m.lastIndex = 35
+      const c = m.exec(text)
+      return c ? c.index + c[0].length : -1
     }
 
     const streamOffsets = new Map() // assistantMessageID -> raw char index already spoken
@@ -2623,7 +2852,24 @@ $audio.PlaySync()
       pumpSpeech()
     }
 
+    // Safety net for a latched busy flag. A speak() that owns playback keeps
+    // `playback` non-null the whole time, so ansBusy/ackBusy with no playback
+    // for several seconds means the promise that should clear it got lost.
+    const SPEECH_STALE_MS = 4000
+    const ACK_DELAY_MS = 700
+    let speechBusySince = 0
+
+    // True while a reply (or its ack/steps) is being voiced or is still queued.
+    function isReplying() {
+      return answerSpeaking || ansBusy || ackBusy || speechPending > 0 || ansQueue.length > 0 || playback !== null
+    }
+
     function pumpSpeech() {
+      if ((ansBusy || ackBusy) && playback === null && Date.now() - speechBusySince > SPEECH_STALE_MS) {
+        log(`tts: watchdog — ansBusy=${ansBusy} ackBusy=${ackBusy} без воспроизведения ${Date.now() - speechBusySince}мс, сбрасываю`)
+        ansBusy = false
+        ackBusy = false
+      }
       if (ansBusy) { log(`tts: pump BLOCKED ansBusy=true queue=${ansQueue.length}`); return }
       if (ackBusy) { log(`tts: pump HELD for ack queue=${ansQueue.length}`); return }
       const next = ansQueue.shift()
@@ -2654,6 +2900,7 @@ $audio.PlaySync()
       // isLast was permanently false and the window never opened at all.
       const isLast = ansQueue.length === 0 && ansFinal
       ansBusy = true
+      speechBusySince = Date.now()
       speak(chunk, { direct: true, isLast }).finally(() => {
         speechPending -= merged
         ansBusy = false
@@ -2670,6 +2917,8 @@ $audio.PlaySync()
     // poller — otherwise it would keep enqueueing new sentences over the user.
     function cancelAnswer() {
       stopStreamPoll()
+      speechGen++ // drop phrases already queued behind the one playing
+      resetDuck()
       ansQueue = []
       speechPending = 0
       ansFinal = false
@@ -2710,9 +2959,12 @@ $audio.PlaySync()
       if (!msgID || !sessionID) return false
       if (sessionID !== currentSessionID()) return false
       if (msgID === speakingMsgID) return false
+      // A turn with tool calls produces several assistant messages. Cutting the
+      // voice on each new one made the bot interrupt itself mid-sentence. A NEW
+      // user turn already clears the old audio in speakAck(), so here the
+      // previous message just finishes and the new text queues behind it.
       if (speakingMsgID !== null) {
-        stopStaleAnswer()
-        log(`stream: new msg ${msgID} supersedes ${speakingMsgID} — stopped stale answer`)
+        log(`stream: new msg ${msgID} follows ${speakingMsgID} — не прерываю озвучку`)
       }
       speakingMsgID = msgID
       return true
@@ -2741,7 +2993,19 @@ $audio.PlaySync()
       } catch {}
       if (!ackPhrases.length || !state.tts || dead) return
       const ackPhrase = ackPhrases[Math.floor(Math.random() * ackPhrases.length)]
+      // Say the ack only if the reply has not started on its own within
+      // ACK_DELAY_MS. With a fast model the answer is there before the ack would
+      // finish, and "ага" in front of it is just a delay. A stop in the
+      // meantime (wake word, new turn) bumps speechGen and cancels it too.
+      const ackGen = speechGen
+      setTimeout(() => {
+      if (dead || !state.tts || ackGen !== speechGen) return
+      if (answerSpeaking || ansBusy || ansQueue.length > 0 || speechPending > 0) {
+        log("ack: ответ уже пошёл — подтверждение пропускаю")
+        return
+      }
       ackBusy = true         // hold steps + answer until the acknowledgment finishes
+      speechBusySince = Date.now()
       log(`ack: "${ackPhrase}"`)
       // speak() can return undefined (e.g. missing model) or throw synchronously;
       // Promise.resolve + a guarded release guarantees ackBusy ALWAYS clears, or
@@ -2760,6 +3024,7 @@ $audio.PlaySync()
         release()
         log(`ack speak error: ${e?.message || e}`)
       }
+      }, ACK_DELAY_MS)
     }
 
     function onStreamPart(event) {
@@ -2834,7 +3099,7 @@ $audio.PlaySync()
       try { if (context.data.session.status(sessionID) !== "running") return } catch {}
       const off = streamOffsets.get(msgID) ?? 0
       if (text.length <= off) return
-      const end = speakableEnd(text, off)
+      const end = nextSpeakableEnd(text, off)
       if (end <= off) return
       streamOffsets.set(msgID, end)
       const chunk = cleanForSpeech(text.slice(off, end))
@@ -2950,7 +3215,7 @@ $audio.PlaySync()
       const accum = (streamAccum.get(msgID) || "") + delta
       streamAccum.set(msgID, accum)
       const off = streamOffsets.get(msgID) ?? 0
-      const end = speakableEnd(accum, off)
+      const end = nextSpeakableEnd(accum, off)
       if (end <= off) return
       streamOffsets.set(msgID, end)
       const chunk = cleanForSpeech(accum.slice(off, end))
@@ -3149,6 +3414,9 @@ $audio.PlaySync()
         if (!state.tts || !stepsTTS || dead) return
         if (stepUserBusy()) return
         const now = Date.now()
+        // The ack ("ага", "принял") already told the user the message was taken.
+        // Saying "Сейчас подумаю" right behind it made two phrases in a row.
+        if (ackPhrases.length && now - lastAckAt < 10000) return
         if (now - lastReasoningAt < 2500) return // one phrase per thinking burst
         lastReasoningAt = now
         announceStep("Сейчас подумаю")
@@ -3211,7 +3479,7 @@ $audio.PlaySync()
         // progress on an old message silence later, shorter ones.
         const joined = parts.map((p) => p.text || "").join("\n")
         const off = streamOffsets.get(m.id) ?? 0
-        const rem = cleanForSpeech(joined.slice(off))
+        const rem = cleanForSpeech(joined.slice(off, Math.max(off, speechLimit(joined))))
         log(`tts: flush msg=${m.id} off=${off} textLen=${joined.length} remLen=${rem.length} ansBusy=${ansBusy}`)
         if (rem) enqueueSpeech(rem)
         streamOffsets.set(m.id, joined.length) // fully consumed — never re-speak this reply
