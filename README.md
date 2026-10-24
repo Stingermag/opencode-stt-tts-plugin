@@ -4,25 +4,33 @@
 
 ## Установка
 
+### Способ 1: Минимальная установка (без NPM)
+
 1. **Скопируйте папку** `voice` в папку плагинов OpenCode:
    ```
    C:\Users\<yourusername>\.config\opencode\plugins\voice\
    ```
 
-2. **Установите зависимости** (через npm в корне проекта OpenCode):
-   ```bash
-   npm install @opentui/core @opentui/solid solid-js
-   ```
+2. **Настройте конфигурацию** в `cli.json` (см. раздел "Настройка")
 
-   Или через yarn:
-   ```bash
-   yarn add @opentui/core @opentui/solid solid-js
-   ```
+### Способ 2: Установка через NPM (необязательно)
 
-   Или через pnpm:
-   ```bash
-   pnpm install @opentui/core @opentui/solid solid-js
-   ```
+Если хотите установить зависимости автоматически:
+ ```bash
+ npm install @opentui/core @opentui/solid solid-js
+ ```
+
+Или через yarn:
+ ```bash
+ yarn add @opentui/core @opentui/solid solid-js
+ ```
+
+Или через pnpm:
+ ```bash
+ pnpm install @opentui/core @opentui/solid solid-js
+ ```
+
+**Примечание**: NPM необязателен для работы плагина. Все зависимости можно установить вручную или использовать готовые пакеты из GitHub.
 
 ## Настройка
 
