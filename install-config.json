@@ -1,0 +1,66 @@
+{
+  "name": "OpenCode Voice Plugin",
+  "description": "Voice input (STT) и озвученные ответы (TTS) для OpenCode",
+  "version": "1.0.0",
+  "install": {
+    "check": {
+      "windows": [
+        "python --version",
+        "sox --version",
+        "node --version"
+      ],
+      "linux": [
+        "python3 --version",
+        "sox --version",
+        "node --version"
+      ]
+    },
+    "install_commands": [
+      {
+        "windows": [
+          "pip install openai-whisper",
+          "git clone https://github.com/rhasspy/piper.git C:\\Tools\\piper",
+          "xcopy /E /I /Y .\\ C:\\Program Files\\OpenCode\\plugins\\voice\\"
+        ],
+        "linux": [
+          "pip3 install openai-whisper",
+          "git clone --recursive https://github.com/rhasspy/piper.git /opt/piper",
+          "cp -r * /opt/opencode/plugins/voice/"
+        ]
+      }
+    ],
+    "requirements": [
+      {
+        "package": "python",
+        "version": ">=3.10",
+        "description": "Python runtime"
+      },
+      {
+        "package": "sox",
+        "description": "SOX audio processing tool"
+      },
+      {
+        "package": "ffmpeg",
+        "description": "FFmpeg for audio conversion"
+      }
+    ],
+    "hotkeys": {
+      "record": "Ctrl+R",
+      "hands_free": "Ctrl+Alt+Space",
+      "alternative_1": "Alt+H",
+      "alternative_2": "Ctrl+Alt+V"
+    },
+    "configuration": {
+      "file": ".config/opencode/cli.json",
+      "required_options": [
+        "whisperCli",
+        "whisperModel",
+        "piper",
+        "voice",
+        "sttLanguage",
+        "llmEndpoint",
+        "llmModel"
+      ]
+    }
+  }
+}
